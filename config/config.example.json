@@ -1,0 +1,13 @@
+{
+  "host": "127.0.0.1",
+  "port": 8817,
+  "local_library": "~/PaperLibrary",
+  "remote_name": "research-server",
+  "ssh_alias": "research-server",
+  "ssh_host": "",
+  "ssh_user": "",
+  "ssh_port": 22,
+  "ssh_key": "",
+  "remote_library": "/home/researcher/paper-tex",
+  "remote_workshop": "/home/researcher/projects"
+}

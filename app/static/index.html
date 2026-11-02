@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>papertex 资料库</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="shortcut icon" href="/favicon.ico">
+<script>
+  let preferredTheme = null;
+  try { preferredTheme = localStorage.getItem('papertex.theme'); } catch {}
+  document.documentElement.dataset.theme = ['light', 'dark'].includes(preferredTheme)
+    ? preferredTheme : (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+</script>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">PT</span><h1>papertex</h1><span class="brand-caption">RESEARCH WORKSPACE</span></div>
+  <div class="header-actions">
+    <div id="status" class="status"><span class="dot"></span><span id="status-text">检查连接…</span></div>
+    <button id="settings-open" type="button" class="ghost" aria-haspopup="dialog">设置</button>
+    <button id="theme-toggle" type="button" class="ghost" aria-label="暗黑模式" aria-pressed="false">暗黑模式</button>
+  </div>
+</header>
+
+<div id="setup-banner" class="setup-banner hidden" role="status">
+  <span id="setup-banner-text">尚未配置远端服务器。</span>
+  <button id="setup-banner-open" type="button" class="mini primary">去设置</button>
+</div>
+
+<nav class="tabs">
+  <button data-tab="library" data-mode="paper" class="active">论文</button>
+  <button data-tab="library" data-mode="note">笔记</button>
+  <button data-tab="library" data-mode="link">链接</button>
+  <button data-tab="upload">上传</button>
+  <button data-tab="refs">项目空间</button>
+</nav>
+
+<main>
+  <section id="tab-library" class="tab active">
+    <div class="lib-bar">
+      <div class="search-field">
+        <svg class="search-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.25"/><path d="m10.2 10.2 3 3"/></svg>
+        <input id="search" type="search" placeholder="搜索 slug / 标题 / 主题 / 年份" aria-label="搜索论文">
+        <kbd class="search-kbd" aria-hidden="true">/</kbd>
+      </div>
+      <div class="lib-bar-actions">
+        <button id="knowledge-add" type="button" class="ghost">添加笔记</button>
+        <button id="topics-manage" type="button" class="ghost">主题管理</button>
+        <span class="bar-sep" aria-hidden="true"></span>
+        <button id="mirror-fix" type="button" class="ghost">镜像修复</button>
+        <button id="dup-scan" type="button" class="ghost">查重</button>
+        <button id="recovery-manage" type="button" class="ghost">回收区</button>
+        <span class="bar-sep" aria-hidden="true"></span>
+        <button id="refresh" type="button" class="icon-btn" title="刷新" aria-label="刷新">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.2 8a5.2 5.2 0 1 1-1.5-3.7M13.2 2.6v3.1h-3.1"/></svg>
+        </button>
+        <button id="expand-all" type="button" class="icon-btn" title="展开全部" aria-label="展开全部">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6.4 4 4 4-4M4 2.9l4 4 4-4"/></svg>
+        </button>
+        <button id="collapse-all" type="button" class="icon-btn" title="收起全部" aria-label="收起全部">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 9.6 4-4 4 4M4 13.1l4-4 4 4"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="lib-filters">
+      <div class="filter-selects">
+        <select id="filter-topic" aria-label="按主题筛选"><option value="">全部主题</option></select>
+        <select id="filter-year" aria-label="按年份筛选"><option value="">全部年份</option></select>
+        <select id="filter-venue" aria-label="按会议或期刊筛选"><option value="">全部会议/期刊</option></select>
+        <select id="filter-reading" aria-label="按阅读状态筛选">
+          <option value="">全部阅读状态</option><option value="queue">阅读队列</option>
+          <option value="unread">待读</option><option value="reading">在读</option>
+          <option value="read">已读</option><option value="reproduce">待复现</option>
+          <option value="none">未标记</option>
+        </select>
+        <select id="filter-tex" aria-label="按 LaTeX 源码筛选">
+          <option value="">全部源码</option><option value="yes">有 TeX</option>
+          <option value="no">无 TeX</option>
+        </select>
+      </div>
+      <label class="filter-toggle"><input type="checkbox" id="only-gaps"> 只看单边</label>
+      <label class="filter-toggle"><input type="checkbox" id="only-starred"> 只看星标 <span id="star-count" class="muted"></span></label>
+      <span id="count" class="count-pill"></span>
+    </div>
+    <div class="layout" id="library-layout">
+      <div id="list" class="list">
+        <div class="view-state loading" role="status">
+          <span class="loading-ring" aria-hidden="true"></span>
+          <strong>加载论文库…</strong>
+        </div>
+      </div>
+      <div class="splitter" id="list-splitter" role="separator" aria-orientation="vertical"
+           tabindex="0" aria-label="调整列表与详情宽度" title="拖动调整列表宽度，双击恢复默认"></div>
+      <div id="detail" class="detail">
+        <div class="detail-placeholder">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3.75h8.5L19 8.25v12H6z"/><path d="M14.25 3.75v4.75H19M9 12.5h6M9 16h4"/></svg>
+          <strong>选择左侧论文查看详情</strong>
+          <p>支持 j / k 或方向键切换，Enter 打开。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-upload" class="tab">
+    <form id="upload-form" class="card form">
+      <h2>上传论文 <button type="button" id="options-refresh" class="ghost mini">刷新列表</button></h2>
+      <div class="row">
+        <label>主题
+          <select id="topic-select" name="topic_select"></select>
+          <input id="topic-new" name="topic_new" class="hidden" placeholder="新主题,如 TS-Example">
+        </label>
+        <label>年份
+          <select id="year-select" name="year_select"></select>
+          <input id="year-new" name="year_new" class="hidden" placeholder="如 2027">
+        </label>
+      </div>
+      <div class="row">
+        <label>会议/期刊
+          <select id="venue-select" name="venue_select"></select>
+          <input id="venue-new" name="venue_new" class="hidden" placeholder="如 TSP">
+        </label>
+        <label>第一作者<input id="author-input" name="author" placeholder="如 Li"></label>
+        <label>关键词<input id="keyword-input" name="keyword" placeholder="如 Example"></label>
+      </div>
+      <label>slug
+        <div class="slug-row">
+          <input id="slug-input" name="slug" readonly placeholder="由 年份-会议-作者-关键词 自动生成">
+          <label class="check"><input type="checkbox" id="slug-manual"> 手动修改</label>
+        </div>
+      </label>
+      <label>arXiv 链接或 ID
+        <div class="slug-row">
+          <input id="arxiv-url" name="arxiv_url" placeholder="https://arxiv.org/abs/2609.24444">
+          <button type="button" id="arxiv-parse" class="mini">抓取信息</button>
+        </div>
+      </label>
+      <div id="arxiv-status" class="muted arxiv-status"></div>
+      <label>OpenReview 链接
+        <div class="slug-row">
+          <input id="openreview-url" name="openreview_url" placeholder="https://openreview.net/forum?id=…">
+          <button type="button" id="openreview-parse" class="mini">抓取信息</button>
+          <button type="button" id="openreview-login-toggle" class="mini ghost">登录</button>
+        </div>
+      </label>
+      <div id="openreview-status" class="muted arxiv-status"></div>
+      <label>IEEE 链接或 DOI
+        <div class="slug-row">
+          <input id="ieee-url" name="ieee_url" placeholder="https://ieeexplore.ieee.org/document/… 或 10.1109/…">
+          <button type="button" id="ieee-parse" class="mini">抓取信息</button>
+        </div>
+      </label>
+      <div id="ieee-status" class="muted arxiv-status"></div>
+      <div id="openreview-login" class="or-login hidden">
+        <div class="muted">OpenReview 现在要求登录后才能读取元数据和 PDF。账号只用于换取 token，token 保存在本机 config/openreview.json。</div>
+        <div class="row">
+          <label>邮箱 / 用户名<input id="openreview-user" autocomplete="username"></label>
+          <label>密码<input id="openreview-pass" type="password" autocomplete="current-password"></label>
+        </div>
+        <div class="row">
+          <button type="button" id="openreview-login-btn" class="mini">登录 OpenReview</button>
+          <span id="openreview-login-status" class="muted"></span>
+        </div>
+      </div>
+      <div class="row">
+        <label>标题<input name="title" placeholder="可选"></label>
+        <label>arXiv<input name="arxiv" placeholder="可选"></label>
+        <label>代码链接<input name="code" placeholder="可选，https://github.com/…"></label>
+      </div>
+      <label>BibTeX（可选）
+        <textarea name="bibtex" rows="4" class="bib-input" placeholder="@article{key,&#10;  title = {…},&#10;  author = {…},&#10;  year = {2026},&#10;  journal = {…}&#10;}"></textarea>
+      </label>
+      <div class="muted bib-hint">粘贴一条 BibTeX 可补齐标题、会议/期刊、年份、作者、DOI；留空则跳过，只导入第一条。</div>
+      <div class="dropzone" id="dropzone">
+        <div class="dropzone-hint">拖拽 PDF / 源码包到这里，或点击下方选择</div>
+        <div class="row">
+          <label class="file">paper.pdf<input type="file" name="pdf" accept="application/pdf"></label>
+          <label class="file">源码包 (.zip/.tar.gz)<input type="file" name="source_archive"></label>
+        </div>
+        <div id="drop-status" class="muted"></div>
+      </div>
+      <label class="check"><input type="checkbox" name="fetch_source"> 已选 PDF 时也抓取 arXiv TeX 源码</label>
+      <label class="check"><input type="checkbox" name="copy_local" checked> 同时复制 pdf 到本机库</label>
+      <div class="actions">
+        <button type="submit">上传</button>
+        <span id="upload-result" class="muted"></span>
+      </div>
+    </form>
+  </section>
+
+  <section id="tab-refs" class="tab">
+    <div class="layout">
+      <div class="list">
+        <div class="pad project-add-box">
+          <div class="section-label">我的项目</div>
+          <div class="seg" id="project-source-seg">
+            <button type="button" data-source="local">本机</button>
+            <button type="button" data-source="remote" class="active" id="source-remote-btn">远端</button>
+          </div>
+          <div class="muted" id="project-add-hint">添加远端 workshop 下的项目</div>
+          <div class="project-add-row">
+            <input id="project-new" placeholder="如 projects/example-project">
+            <button id="project-add" class="mini">添加</button>
+          </div>
+          <div id="project-add-status" class="muted"></div>
+        </div>
+        <div id="project-list"><p class="muted pad">加载中…</p></div>
+      </div>
+      <div class="detail">
+        <h3>项目 <span id="refs-project" class="muted"></span></h3>
+        <div class="toolbar inner">
+          <div class="seg" id="project-pane-seg">
+            <button type="button" data-pane="refs" class="active">引用</button>
+            <button type="button" data-pane="files">文件</button>
+          </div>
+          <span id="refs-result" class="muted"></span>
+        </div>
+        <div id="refs-pane">
+          <div class="toolbar inner">
+            <button id="refs-sync-all" class="ghost mini">全部按库更新</button>
+            <button id="refs-export-bib" class="ghost mini">导出 BibTeX</button>
+            <button id="refs-remove-project" class="ghost mini danger">移出列表</button>
+          </div>
+          <div id="refs-file" class="muted pad refs-file"></div>
+          <div id="refs-current"><p class="muted pad">先在左侧添加或选择项目</p></div>
+        </div>
+        <div id="files-pane" class="hidden">
+          <div class="file-filters">
+            <span class="muted">显示类型</span>
+            <div id="files-types" class="type-chips"></div>
+            <span class="read-only-label">只读浏览</span>
+          </div>
+          <div class="toolbar inner file-navigation">
+            <button id="files-recent" class="ghost mini">最近修改</button>
+            <button id="files-root" class="ghost mini">项目根目录</button>
+            <button id="files-up" class="ghost mini" disabled>上一级</button>
+            <button id="files-refresh" class="ghost mini">刷新</button>
+            <span id="files-result" class="muted"></span>
+          </div>
+          <nav id="files-path" class="files-path muted pad" aria-label="项目文件路径"></nav>
+          <div id="files-list"><p class="muted pad">选择左侧项目查看文件</p></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<dialog id="confirm-modal" class="modal hidden" aria-labelledby="confirm-title" aria-describedby="confirm-text">
+  <div class="modal-box confirm-box" role="document">
+    <div class="modal-head">
+      <span id="confirm-title" class="slug">确认操作</span>
+    </div>
+    <div class="confirm-body">
+      <p id="confirm-text"></p>
+      <label id="confirm-field" class="hidden">
+        <span id="confirm-label"></span>
+        <input id="confirm-input" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <span id="confirm-hint" class="muted"></span>
+      </label>
+    </div>
+    <div class="confirm-actions">
+      <button type="button" id="confirm-cancel" class="ghost">取消</button>
+      <button type="button" id="confirm-ok">确认</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="topics-modal" class="modal hidden" aria-labelledby="topics-modal-title">
+  <div class="modal-box topics-box">
+    <div class="modal-head">
+      <span id="topics-modal-title" class="slug">主题管理</span>
+      <span id="topics-result" class="muted" role="status"></span>
+      <button id="topics-modal-close" class="mini ghost" autofocus>关闭</button>
+    </div>
+    <div id="topics-list" class="topics-list"></div>
+  </div>
+</dialog>
+
+<dialog id="pdf-modal" class="modal hidden" aria-labelledby="pdf-modal-title">
+  <div class="modal-box">
+    <div class="modal-head">
+      <span id="pdf-modal-title" class="slug"></span>
+      <button id="pdf-modal-tab" type="button" class="mini ghost">新标签页打开</button>
+      <button id="pdf-modal-close" class="mini ghost" autofocus>关闭</button>
+    </div>
+    <div class="preview-stack">
+      <div id="pdf-preview-status" class="preview-status"></div>
+      <iframe id="pdf-modal-frame" title="PDF 预览"></iframe>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="image-modal" class="modal hidden" aria-labelledby="image-modal-title" aria-describedby="image-shortcuts">
+  <div class="modal-box image-box">
+    <div class="modal-head">
+      <span id="image-modal-title" class="slug"></span>
+      <button id="image-modal-close" class="mini ghost" autofocus>关闭</button>
+    </div>
+    <div class="image-toolbar">
+      <button id="image-zoom-out" class="mini" aria-label="缩小图片">−</button>
+      <output id="image-zoom-value" aria-live="polite">适应窗口</output>
+      <button id="image-zoom-in" class="mini" aria-label="放大图片">+</button>
+      <button id="image-fit" class="mini ghost">适应窗口</button>
+      <button id="image-actual" class="mini ghost">原始大小</button>
+      <span id="image-shortcuts" class="muted">+ / − 缩放 · 0 原始大小 · F 适应 · Esc 关闭</span>
+    </div>
+    <div id="image-preview-status" class="preview-status"></div>
+    <div class="image-body" tabindex="0" aria-label="图片预览，方向键滚动"><img id="image-modal-img" alt="项目图片预览"></div>
+  </div>
+</dialog>
+<dialog id="mirror-modal" class="modal hidden" aria-labelledby="mirror-modal-title">
+  <div class="modal-box panel-box">
+    <div class="modal-head">
+      <span id="mirror-modal-title" class="slug">镜像修复</span>
+      <span id="mirror-result" class="muted panel-status" role="status"></span>
+      <button id="mirror-modal-close" class="mini ghost" autofocus>关闭</button>
+    </div>
+    <div class="panel-toolbar">
+      <div class="seg" id="mirror-seg">
+        <button type="button" data-direction="pull" class="active">本机缺失</button>
+        <button type="button" data-direction="push" id="mirror-push-label">远端缺失</button>
+      </div>
+      <label class="inline"><input type="checkbox" id="mirror-all"> 全选</label>
+      <span id="mirror-count" class="muted"></span>
+      <button id="mirror-run" type="button" class="mini primary" disabled>执行选中</button>
+    </div>
+    <div id="mirror-list" class="panel-list"></div>
+  </div>
+</dialog>
+
+<dialog id="dup-modal" class="modal hidden" aria-labelledby="dup-modal-title">
+  <div class="modal-box panel-box">
+    <div class="modal-head">
+      <span id="dup-modal-title" class="slug">全库查重</span>
+      <span id="dup-result" class="muted panel-status" role="status"></span>
+      <button id="dup-modal-close" class="mini ghost" autofocus>关闭</button>
+    </div>
+    <div class="panel-toolbar">
+      <span class="muted">按 arXiv 编号、规范化标题、pdf 内容分组；保留项决定合并后的位置。</span>
+      <button id="dup-rescan" type="button" class="mini ghost">重新扫描</button>
+    </div>
+    <div id="dup-list" class="panel-list"></div>
+  </div>
+</dialog>
+
+<dialog id="recovery-modal" class="modal hidden" aria-labelledby="recovery-modal-title">
+  <div class="modal-box panel-box">
+    <div class="modal-head">
+      <span id="recovery-modal-title" class="slug">回收区</span>
+      <span id="recovery-result" class="muted panel-status" role="status"></span>
+      <button id="recovery-modal-close" class="mini ghost" autofocus>关闭</button>
+    </div>
+    <div class="panel-toolbar">
+      <span id="recovery-summary" class="muted"></span>
+      <button id="recovery-refresh" type="button" class="mini ghost">刷新</button>
+      <button id="recovery-purge-all" type="button" class="mini danger">全部清理</button>
+    </div>
+    <div id="recovery-list" class="panel-list"></div>
+  </div>
+</dialog>
+
+<dialog id="knowledge-modal" class="modal hidden" aria-labelledby="knowledge-modal-title">
+  <div class="modal-box knowledge-box">
+    <div class="modal-head">
+      <span id="knowledge-modal-title" class="slug">添加笔记</span>
+      <button id="knowledge-modal-close" type="button" class="mini ghost" autofocus>关闭</button>
+    </div>
+    <form id="knowledge-form" class="form knowledge-form">
+      <div class="row">
+        <label>类型
+          <select id="knowledge-kind" name="kind">
+            <option value="note">笔记</option><option value="link">链接</option>
+          </select>
+        </label>
+        <label>来源<input id="knowledge-source" name="source" maxlength="200" placeholder="如 博客 / 知乎 / 群聊"></label>
+      </div>
+      <label>标题<input id="knowledge-title" name="title" maxlength="200" required placeholder="一句话标题"></label>
+      <label>链接<input id="knowledge-url" name="url" maxlength="2000" placeholder="https://…（笔记也可以填）"></label>
+      <label>标签<input id="knowledge-tags" name="tags" maxlength="900" placeholder="用逗号分隔，如 时序, 扩散模型"></label>
+      <div class="row">
+        <label class="mini ghost" for="knowledge-md" role="button" tabindex="0" id="knowledge-md-btn">导入 .md</label>
+        <input type="file" id="knowledge-md" class="supp-input" accept=".md,.markdown,.txt,text/markdown,text/plain">
+        <span class="muted">选择 Markdown 文件载入正文；保存后存为远端的 note.md</span>
+      </div>
+      <label>正文<textarea id="knowledge-body" name="body" rows="10" maxlength="100000" placeholder="Markdown / 纯文本，保留换行和缩进"></textarea></label>
+      <div id="knowledge-status" class="muted" role="status"></div>
+      <div class="actions">
+        <button type="submit" id="knowledge-save">保存</button>
+        <button type="button" id="knowledge-cancel" class="ghost">取消</button>
+      </div>
+    </form>
+  </div>
+</dialog>
+
+<dialog id="settings-modal" class="modal hidden" aria-labelledby="settings-modal-title">
+  <div class="modal-box settings-box">
+    <div class="modal-head">
+      <span id="settings-modal-title" class="slug">设置</span>
+      <button id="settings-modal-close" type="button" class="mini ghost" autofocus>关闭</button>
+    </div>
+    <form id="settings-form" class="form settings-form">
+      <h2>本机</h2>
+      <div class="row">
+        <label>本机镜像库路径<input id="settings-local-library" placeholder="~/PaperLibrary"></label>
+        <label>监听端口<input id="settings-port" inputmode="numeric" placeholder="8817"></label>
+      </div>
+
+      <h2>远端服务器</h2>
+      <label>显示名称<input id="settings-remote-name" placeholder="如 research-server 或 my-lab"></label>
+      <label>连接方式
+        <select id="settings-connection">
+          <option value="direct">主机直连</option>
+          <option value="alias">SSH 别名（~/.ssh/config）</option>
+        </select>
+      </label>
+      <div id="settings-direct">
+        <div class="row">
+          <label>主机<input id="settings-ssh-host" placeholder="192.0.2.10 或 lab.example.com"></label>
+          <label>用户名<input id="settings-ssh-user" placeholder="researcher"></label>
+          <label>SSH 端口<input id="settings-ssh-port" inputmode="numeric" placeholder="22"></label>
+        </div>
+        <label>私钥路径（可选，留空使用 ssh-agent）<input id="settings-ssh-key" placeholder="~/.ssh/id_ed25519"></label>
+      </div>
+      <div id="settings-alias" class="hidden">
+        <label>SSH 别名<input id="settings-ssh-alias" placeholder="research-server"></label>
+        <div class="muted">别名来自本机 ~/.ssh/config，可继续使用 ProxyJump、IdentityFile 等已有配置。</div>
+      </div>
+      <div class="row">
+        <label>远端资料库路径<input id="settings-remote-library" placeholder="/home/researcher/paper-tex"></label>
+        <label>远端项目根目录<input id="settings-remote-workshop" placeholder="/home/researcher/projects"></label>
+      </div>
+      <div class="muted">只支持密钥或 ssh-agent，不保存密码；首次连接前请先在终端确认主机指纹。</div>
+      <div id="settings-checks" class="settings-checks"></div>
+      <div class="actions">
+        <button type="button" id="settings-test" class="mini">测试连接</button>
+        <button type="submit" id="settings-save" class="mini primary">保存</button>
+        <span id="settings-status" class="muted" role="status"></span>
+      </div>
+    </form>
+  </div>
+</dialog>
+
+<div id="toasts" class="toasts" role="region" aria-label="通知" aria-live="polite"></div>
+<script src="/app.js"></script>
+</body>
+</html>

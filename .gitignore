@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+logs/
+*.log
+*.pid
+.write.lock
+
+# Local configuration and personal state (examples are tracked)
+config/*.json
+!config/config.example.json
+!config/projects.example.json
+config/*.lock
+
+# Personal one-off migration scripts kept outside the public repository
+scripts/import_library.py
+scripts/sync_*.py
+
+.idea/
+.vscode/
