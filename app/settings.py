@@ -176,18 +176,13 @@ def host_target(cfg):
 
 
 def scp_target(cfg):
-    """scp 使用 -P 指定端口，其余参数与 ssh 保持一致。"""
-    target = ssh_target(cfg)
-    out = []
-    index = 0
-    while index < len(target):
-        if target[index] == "-p":
-            out += ["-P", target[index + 1]]
-            index += 2
-        else:
-            out.append(target[index])
-            index += 1
-    return out
+    """scp 只接收选项；主机由 host_target 单独拼到目标路径上。"""
+    if cfg.get("ssh_alias"):
+        return []
+    args = ["-P", str(cfg.get("ssh_port") or 22)]
+    if cfg.get("ssh_key"):
+        args += ["-i", os.path.expanduser(cfg["ssh_key"])]
+    return args
 
 
 def target_label(cfg):

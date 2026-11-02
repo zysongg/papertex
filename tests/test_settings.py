@@ -47,7 +47,7 @@ class SettingsTests(unittest.TestCase):
         })
         self.assertEqual(config_store.ssh_target(alias), ['lab'])
         self.assertEqual(config_store.host_target(alias), 'lab')
-        self.assertEqual(config_store.scp_target(alias), ['lab'])
+        self.assertEqual(config_store.scp_target(alias), [])
         self.assertEqual(alias['ssh_host'], '')
 
         direct = config_store.normalize({
@@ -56,8 +56,7 @@ class SettingsTests(unittest.TestCase):
         })
         self.assertEqual(config_store.ssh_target(direct),
                          ['-p', '2222', 'researcher@192.0.2.10'])
-        self.assertEqual(config_store.scp_target(direct),
-                         ['-P', '2222', 'researcher@192.0.2.10'])
+        self.assertEqual(config_store.scp_target(direct), ['-P', '2222'])
         self.assertEqual(config_store.host_target(direct), 'researcher@192.0.2.10')
 
     def test_invalid_values_are_rejected(self):
