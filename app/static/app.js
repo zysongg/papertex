@@ -1,6 +1,8 @@
 const COLLAPSE_KEY = 'papertex.collapsed';
 const LIBRARY_MODE_KEY = 'papertex.libraryMode';
 const LIBRARY_MODES = ['paper', 'note', 'link'];
+const SORT_MODE_KEY = 'papertex.sortMode';
+const SORT_MODES = ['default', 'added'];
 const PROJECT_SOURCE_KEY = 'papertex.projectSource';
 const PROJECT_SOURCE_LABELS = { remote: '远端', local: '本机' };
 
@@ -34,6 +36,18 @@ function loadLibraryMode() {
 
 function saveLibraryMode(mode) {
   try { localStorage.setItem(LIBRARY_MODE_KEY, mode); } catch {}
+}
+
+function loadSortMode() {
+  try {
+    const v = localStorage.getItem(SORT_MODE_KEY);
+    if (SORT_MODES.includes(v)) return v;
+  } catch {}
+  return 'default';
+}
+
+function saveSortMode(mode) {
+  try { localStorage.setItem(SORT_MODE_KEY, mode); } catch {}
 }
 
 function loadCollapsed() {
@@ -75,6 +89,7 @@ const state = {
   remoteError: '',
   search: '',
   libraryMode: loadLibraryMode(),
+  sortMode: loadSortMode(),
   topicFilter: '',
   yearFilter: '',
   venueFilter: '',
@@ -613,7 +628,7 @@ async function loadLibrary() {
       state.knowledge = [];
       state.knowledgeError = knowledge.reason?.message || '资料读取失败';
     }
-    const blank = () => ({ has_pdf: false, pdf: '', has_source: false, entry: '', title: '', venue: '', code: '', openreview: '', doi: '' });
+    const blank = () => ({ has_pdf: false, pdf: '', has_source: false, entry: '', title: '', venue: '', code: '', openreview: '', doi: '', added_at: '' });
     const map = new Map();
     for (const it of local.value.items) {
       map.set(it.key, {
@@ -621,6 +636,7 @@ async function loadLibrary() {
         local: {
           has_pdf: it.has_pdf, pdf: it.pdf,
           title: it.title || '', venue: it.venue || '',
+          added_at: it.added_at || '',
         },
         remote: blank(),
       });
@@ -634,7 +650,7 @@ async function loadLibrary() {
         cur.remote = {
           has_pdf: it.has_pdf, pdf: it.pdf, has_source: it.has_source,
           entry: it.entry, title: it.title, venue: it.venue, code: it.code || '',
-          openreview: it.openreview || '', doi: it.doi || '',
+          openreview: it.openreview || '', doi: it.doi || '', added_at: it.added_at || '',
         };
         map.set(it.key, cur);
       }
@@ -815,6 +831,20 @@ function itemVenue(it) {
   return meta || it.slug.split('-')[1] || '';
 }
 
+function itemAddedAt(it) {
+  return it.remote?.added_at || it.local?.added_at || '';
+}
+
+function addedTime(it) {
+  const t = Date.parse(itemAddedAt(it));
+  return Number.isNaN(t) ? 0 : t;
+}
+
+function sortByAdded(items) {
+  return [...items].sort((a, b) =>
+    addedTime(b) - addedTime(a) || a.slug.localeCompare(b.slug));
+}
+
 function populateFilters() {
   const topics = [...new Set(state.items.map(i => i.topic))].sort();
   const years = [...new Set(state.items.map(i => i.year))].sort().reverse();
@@ -846,8 +876,11 @@ function syncLibraryMode() {
   const paper = mode === 'paper';
   const label = knowledgeLabel(mode);
   const toggle = (sel, on) => $$(sel).forEach(el => el.classList.toggle('hidden', !on));
-  toggle('#topics-manage, #mirror-fix, #dup-scan, #expand-all, #collapse-all', paper);
+  toggle('#topics-manage, #mirror-fix, #dup-scan', paper);
+  toggle('#expand-all, #collapse-all', paper && state.sortMode !== 'added');
   toggle('.filter-selects', paper);
+  const sortSelect = $('#sort-mode');
+  if (sortSelect) sortSelect.value = state.sortMode;
   toggle('.lib-bar-actions .bar-sep', paper);
   const gaps = $('#only-gaps')?.closest('label');
   if (gaps) gaps.classList.toggle('hidden', !paper);
@@ -968,16 +1001,21 @@ function compareBadges(it) {
     ${gapsKnown && !l && remoteAny ? `<span class="badge warn">仅 ${esc(remoteLabel())}</span>` : ''}`;
 }
 
-function itemHtml(it) {
+function itemHtml(it, opts = {}) {
   if (it?.kind === 'note' || it?.kind === 'link') return knowledgeItemHtml(it);
   const title = itemTitle(it);
   const active = state.current && state.current.key === it.key;
+  const added = opts.context ? knowledgeDate(itemAddedAt(it)) : '';
+  const context = opts.context
+    ? `<div class="item-sub">${esc(it.topic)} · ${esc(it.year)}${added ? ' · 添加于 ' + esc(added) : ''}</div>`
+    : '';
   return `
     <div class="item ${active ? 'active' : ''}" data-key="${esc(it.key)}"
          role="button" tabindex="0" aria-current="${active ? 'true' : 'false'}">
       <div class="item-main">
         <div class="item-slug">${esc(it.slug)}</div>
         ${title ? `<div class="item-title">${esc(displayTitle(title))}</div>` : ''}
+        ${context}
         <div class="research-badges">${researchBadge(it.key)}</div>
       </div>
       <button class="star ${state.stars.has(it.key) ? 'on' : ''}" data-star="${esc(it.key)}"
@@ -1104,6 +1142,13 @@ function renderList() {
     renderViewState($('#list'), 'empty',
       all.length ? '没有匹配的论文' : '论文库还是空的',
       all.length ? '试试其他关键词，或减少筛选条件。' : '在「上传」里导入第一篇论文。');
+    return;
+  }
+
+  if (state.sortMode === 'added') {
+    $('#list').innerHTML = sortByAdded(items)
+      .map(it => itemHtml(it, { context: true })).join('');
+    bindListItems(focusedKey);
     return;
   }
 
@@ -1593,6 +1638,7 @@ async function showDetail(it) {
   };
   const pdfUrl = anyPdf
     ? paperPdfUrl(state.previewSource, it.topic, it.year, it.slug) : '';
+  const pdfTabHref = anyPdf ? pdfViewerUrl(pdfUrl, it.slug) : '';
   const codeUrl = /^https?:\/\//i.test(r.code || '') ? r.code : '';
   const orUrl = /^https?:\/\//i.test(r.openreview || '') ? r.openreview : '';
   const doiUrl = /^10\.\d{4,9}\//.test(r.doi || '') ? 'https://doi.org/' + r.doi : '';
@@ -1636,8 +1682,8 @@ async function showDetail(it) {
           ${l.has_pdf ? `<button data-p="local" class="${state.previewSource === 'local' ? 'active' : ''}">本机 pdf</button>` : ''}
           ${r.has_pdf ? `<button data-p="remote" class="${state.previewSource === 'remote' ? 'active' : ''}">${esc(remoteLabel())} pdf</button>` : ''}
         </div>
-      </div>
-      <iframe src="${pdfUrl}" title="paper.pdf"></iframe>` : '<p class="muted pad">两侧都没有 pdf</p>'}
+        <a class="mini" id="btn-pdf-tab" href="${esc(pdfTabHref)}" target="_blank" rel="noopener noreferrer">在新标签页打开 PDF</a>
+      </div>` : '<p class="muted pad">两侧都没有 pdf</p>'}
   `;
 
   const suppPdf = $('#supp-pdf');
@@ -3001,70 +3047,59 @@ async function saveRefs(msg) {
   return session.queue;
 }
 
-async function openPdfModal(key, title, source = 'remote') {
-  const parts = String(key || '').split('/');
-  if (parts.length !== 3) return;
-  const [topic, year, slug] = parts;
-  return openPreview('pdf', title || slug, () => paperPdfUrl(source, topic, year, slug));
+function pdfViewerUrl(pdfUrl, title) {
+  return '/pdf-view.html?title=' + encodeURIComponent(title || 'PDF') +
+    '&src=' + encodeURIComponent(pdfUrl);
 }
 
-function closePdfModal() {
-  closePreview();
+async function openPdfTab(urlFactory, title) {
+  await loadPdfToken();
+  const anchor = document.createElement('a');
+  anchor.href = pdfViewerUrl(urlFactory(), title);
+  anchor.target = '_blank';
+  anchor.rel = 'noopener noreferrer';
+  anchor.style.display = 'none';
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
 }
 
 let activePreview = null;
 let imageScale = 1;
 let imageFits = true;
 
-async function openPreview(kind, title, urlFactory) {
+async function openImagePreview(title, urlFactory) {
   const opener = activePreview?.opener || document.activeElement;
   if (activePreview) closePreview();
-  const modal = $(`#${kind}-modal`);
-  const status = $(`#${kind}-preview-status`);
-  const media = kind === 'pdf' ? $('#pdf-modal-frame') : $('#image-modal-img');
-  const session = { kind, modal, opener };
+  const modal = $('#image-modal');
+  const status = $('#image-preview-status');
+  const media = $('#image-modal-img');
+  const session = { modal, opener };
   activePreview = session;
-  $(`#${kind}-modal-title`).textContent = title;
-  // Chrome 的 PDF 阅读器若在 display:none 的 iframe 里初始化，会丢掉工具栏和缩放控件
-  if (kind === 'pdf') media.classList.remove('hidden');
-  else media.classList.add('hidden');
+  $('#image-modal-title').textContent = title;
+  media.classList.add('hidden');
   renderViewState(status, 'loading', '正在加载预览', '正在从远端读取文件…');
   modal.classList.remove('hidden');
   modal.showModal();
   document.body.classList.add('preview-open');
-  $(`#${kind}-modal-close`).focus();
-  if (kind === 'image') {
-    imageFits = true;
-    $('#image-modal-img').alt = title;
-    setImageControls(false);
-  }
+  $('#image-modal-close').focus();
+  imageFits = true;
+  media.alt = title;
+  setImageControls(false);
   await loadPdfToken();
   if (activePreview !== session) return;
   const fail = message => {
     if (activePreview !== session) return;
     media.classList.add('hidden');
     renderViewState(status, 'error', '预览加载失败', message,
-      () => openPreview(kind, title, urlFactory));
+      () => openImagePreview(title, urlFactory));
   };
   media.onload = () => {
     if (activePreview !== session) return;
-    if (kind === 'pdf') {
-      try {
-        const doc = media.contentDocument;
-        if (doc?.URL === 'about:blank') return;
-        if (doc?.contentType === 'application/json') {
-          const error = JSON.parse(doc.body.textContent);
-          fail(error.detail || '文件读取失败');
-          return;
-        }
-      } catch {}
-    }
     status.innerHTML = '';
     media.classList.remove('hidden');
-    if (kind === 'image') {
-      setImageControls(true);
-      fitImage();
-    }
+    setImageControls(true);
+    fitImage();
   };
   media.onerror = () => fail('请检查网络连接和文件是否存在，然后重试。');
   media.src = urlFactory();
@@ -3072,13 +3107,12 @@ async function openPreview(kind, title, urlFactory) {
 
 function closePreview() {
   if (!activePreview) return;
-  const { kind, modal, opener } = activePreview;
+  const { modal, opener } = activePreview;
   activePreview = null;
-  const media = kind === 'pdf' ? $('#pdf-modal-frame') : $('#image-modal-img');
+  const media = $('#image-modal-img');
   media.onload = null;
   media.onerror = null;
-  if (kind === 'pdf') media.src = 'about:blank';
-  else media.removeAttribute('src');
+  media.removeAttribute('src');
   modal.close();
   modal.classList.add('hidden');
   document.body.classList.remove('preview-open');
@@ -3119,22 +3153,18 @@ $('#image-zoom-out').onclick = () => setImageScale(imageScale / 1.25);
 $('#image-fit').onclick = fitImage;
 $('#image-actual').onclick = () => setImageScale(1);
 window.addEventListener('resize', () => {
-  if (activePreview?.kind === 'image' && imageFits) fitImage();
+  if (activePreview && imageFits) fitImage();
 });
-for (const kind of ['pdf', 'image']) {
-  const modal = $(`#${kind}-modal`);
-  $(`#${kind}-modal-close`).onclick = closePreview;
+(() => {
+  const modal = $('#image-modal');
+  $('#image-modal-close').onclick = closePreview;
   modal.onclick = e => { if (e.target === modal) closePreview(); };
   modal.oncancel = e => { e.preventDefault(); closePreview(); };
-}
-$('#pdf-modal-tab').onclick = () => {
-  const url = $('#pdf-modal-frame').getAttribute('src');
-  if (url && url !== 'about:blank') window.open(url, '_blank', 'noopener');
-};
+})();
 document.addEventListener('keydown', e => {
   if (!activePreview) return;
   if (e.key === 'Escape') { e.preventDefault(); closePreview(); return; }
-  if (activePreview.kind !== 'image' || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
   const action = {
     '+': () => setImageScale(imageScale * 1.25),
     '=': () => setImageScale(imageScale * 1.25),
@@ -3338,17 +3368,13 @@ function showRecentProjectFiles() {
 async function openProjectPdf(path, title) {
   const project = state.project;
   const source = state.projectSource;
-  return openPreview('pdf', title || path, () => projectFileUrl(project, path, source));
+  await openPdfTab(() => projectFileUrl(project, path, source), title || path);
 }
 
 async function openProjectImage(path, title) {
   const project = state.project;
   const source = state.projectSource;
-  return openPreview('image', title || path, () => projectFileUrl(project, path, source));
-}
-
-function closeImageModal() {
-  closePreview();
+  return openImagePreview(title || path, () => projectFileUrl(project, path, source));
 }
 
 function refRow(r, i) {
@@ -3427,8 +3453,11 @@ function renderRefs() {
   $$('#refs-current button[data-preview]').forEach(btn => {
     btn.onclick = () => {
       const ref = state.refs[Number(btn.dataset.preview)];
-      const title = ref.title || (ref.current && ref.current.title) || ref.path;
-      openPdfModal(ref.path, title, state.refsSession?.source || 'remote');
+      const parts = String(ref.path || '').split('/');
+      if (parts.length !== 3) return;
+      const [topic, year, slug] = parts;
+      const source = state.refsSession?.source || 'remote';
+      openPdfTab(() => paperPdfUrl(source, topic, year, slug), slug);
     };
   });
   $$('#refs-current button[data-open-local]').forEach(btn => {
@@ -3524,6 +3553,12 @@ $('#search').onkeydown = e => {
 $('#filter-topic').onchange = e => { syncSearch(); state.topicFilter = e.target.value; renderList(); };
 $('#filter-year').onchange = e => { syncSearch(); state.yearFilter = e.target.value; renderList(); };
 $('#filter-venue').onchange = e => { syncSearch(); state.venueFilter = e.target.value; renderList(); };
+$('#sort-mode').onchange = e => {
+  state.sortMode = SORT_MODES.includes(e.target.value) ? e.target.value : 'default';
+  saveSortMode(state.sortMode);
+  syncLibraryMode();
+  renderList();
+};
 $('#refresh').onclick = loadLibrary;
 $('#knowledge-add').onclick = () => openKnowledgeEditor(null);
 $('#knowledge-form').onsubmit = submitKnowledge;

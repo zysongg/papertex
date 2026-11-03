@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>PDF</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #525659; }
+  iframe { display: block; width: 100%; height: 100%; border: 0; }
+  p { margin: 0; padding: 24px; color: #fff; font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+</style>
+</head>
+<body>
+<iframe id="pdf-frame" title="PDF 预览"></iframe>
+<script>
+(() => {
+  const params = new URLSearchParams(location.search);
+  const src = params.get('src') || '';
+  const title = params.get('title') || '';
+  const frame = document.getElementById('pdf-frame');
+  if (title) document.title = title;
+  if (!/^\/api\/(pdf|project\/file)\?/.test(src)) {
+    frame.remove();
+    const message = document.createElement('p');
+    message.textContent = '无效的预览地址';
+    document.body.append(message);
+    return;
+  }
+  frame.title = title || 'PDF 预览';
+  frame.src = src;
+})();
+</script>
+</body>
+</html>

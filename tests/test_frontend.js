@@ -5,7 +5,7 @@ const vm = require('node:vm');
 const { test } = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '../app/static/app.js'), 'utf8');
-const functions = source.slice(source.indexOf('async function loadRefs()'), source.indexOf('async function openPdfModal'));
+const functions = source.slice(source.indexOf('async function loadRefs()'), source.indexOf('async function openPdfTab'));
 
 function themeFixture(saved, dark = false, blocked = false) {
   const storage = new Map(saved === null ? [] : [['papertex.theme', saved]]);
@@ -154,6 +154,44 @@ test('paper titles are display-cased in lists while itemTitle keeps the stored v
   };
   assert.match(c.itemHtml(it), /Mixmodel: A Study/);
   assert.equal(c.itemTitle(it), 'MIXMODEL: A STUDY');
+});
+
+test('added-time sort puts newest first and leaves undated papers last', () => {
+  const c = listItemFixture();
+  const item = (slug, added) => ({
+    key: 'TS/2024/' + slug, slug, topic: 'TS', year: '2024',
+    local: { has_pdf: true, pdf: 'paper.pdf', title: '', venue: '', added_at: '' },
+    remote: {
+      has_pdf: true, pdf: 'paper.pdf', has_source: false, entry: '',
+      title: '', venue: '', added_at: added,
+    },
+  });
+  const sorted = c.sortByAdded([
+    item('b', '2026-01-01T00:00:00+00:00'),
+    item('a', '2026-03-01T00:00:00Z'),
+    item('c', ''),
+    item('d', '2026-02-01T00:00:00+00:00'),
+    item('e', '2026-03-01T00:00:00+00:00'),
+  ]);
+  assert.deepEqual(Array.from(sorted, x => x.slug), ['a', 'e', 'd', 'b', 'c']);
+});
+
+test('added-time view adds topic, year and date context under the title', () => {
+  const c = listItemFixture();
+  const added = '2026-03-01T12:00:00+00:00';
+  const start = source.indexOf('function knowledgeDate');
+  vm.runInContext(source.slice(start, source.indexOf('function knowledgeDetailHtml', start)), c);
+  const it = {
+    key: 'TS/2026/2026-ICML-Li-x', slug: '2026-ICML-Li-x', topic: 'TS', year: '2026',
+    local: { has_pdf: true, pdf: 'paper.pdf', title: '', venue: '', added_at: '' },
+    remote: {
+      has_pdf: true, pdf: 'paper.pdf', has_source: false, entry: '',
+      title: 'A title', venue: 'ICML', added_at: added,
+    },
+  };
+  const html = c.itemHtml(it, { context: true });
+  assert.ok(html.includes('TS · 2026 · 添加于 ' + c.knowledgeDate(added)));
+  assert.doesNotMatch(c.itemHtml(it), /添加于/);
 });
 
 function projectOrderFixture(usage = {}, blocked = false) {
@@ -880,29 +918,54 @@ function previewFixture(loadToken = async () => {}) {
   return c;
 }
 
-test('preview refreshes the token before building its URL and restores focus', async () => {
+test('image preview refreshes the token before building its URL and restores focus', async () => {
   let token = 'stale';
   const c = previewFixture(async () => { token = 'fresh'; });
-  await c.openPreview('pdf', '标题', () => 'url?token=' + token);
-  assert.equal(c.$('#pdf-modal-title').textContent, '标题');
-  assert.equal(c.$('#pdf-modal-frame').src, 'url?token=fresh');
-  assert.equal(c.$('#pdf-modal-frame').classList.contains('hidden'), false,
-    'PDF iframe must stay visible so the browser viewer initializes with its toolbar');
-  assert.equal(c.$('#pdf-modal').open, true);
+  await c.openImagePreview('标题', () => 'url?token=' + token);
+  assert.equal(c.$('#image-modal-title').textContent, '标题');
+  assert.equal(c.$('#image-modal-img').src, 'url?token=fresh');
+  c.$('#image-modal-img').onload();
+  assert.equal(c.$('#image-modal-img').classList.contains('hidden'), false);
+  assert.equal(c.$('#image-modal').open, true);
   c.closePreview();
-  assert.equal(c.$('#pdf-modal').open, false);
+  assert.equal(c.$('#image-modal').open, false);
   assert.equal(c.document.activeElement.restored, true);
 });
 
-test('closing preview during token refresh cancels the pending media load', async () => {
+test('closing image preview during token refresh cancels the pending media load', async () => {
   const pending = deferred();
   const c = previewFixture(() => pending.promise);
-  const opening = c.openPreview('pdf', '标题', () => 'obsolete-url');
+  const opening = c.openImagePreview('标题', () => 'obsolete-url');
   c.closePreview();
   pending.resolve();
   await opening;
-  assert.equal(c.$('#pdf-modal-frame').src, 'about:blank');
-  assert.equal(c.$('#pdf-modal').open, false);
+  assert.equal(c.$('#image-modal-img').src, undefined);
+  assert.equal(c.$('#image-modal').open, false);
+});
+
+test('PDF previews open a new tab after refreshing the token, titled by slug', async () => {
+  const clicks = [];
+  let token = 'stale';
+  const c = vm.createContext({
+    state: { pdfToken: 'stale' },
+    loadPdfToken: async () => { token = 'fresh'; },
+    encodeURIComponent,
+    document: {
+      body: { append() {} },
+      createElement: () => ({
+        style: {},
+        click() { clicks.push({ href: this.href, target: this.target, rel: this.rel }); },
+        remove() {},
+      }),
+    },
+  });
+  vm.runInContext(source.slice(source.indexOf('function pdfViewerUrl'), source.indexOf('let activePreview')), c);
+  await c.openPdfTab(() => '/api/pdf?token=' + token, '2026-AAA-Liu-TDBA');
+  assert.deepEqual(clicks, [{
+    href: '/pdf-view.html?title=2026-AAA-Liu-TDBA&src=' + encodeURIComponent('/api/pdf?token=fresh'),
+    target: '_blank',
+    rel: 'noopener noreferrer',
+  }]);
 });
 
 test('image zoom has bounds and fit accounts for viewport padding', () => {
@@ -1318,4 +1381,37 @@ test('settings checks render pass and failure rows without markup injection', ()
   assert.match(html, /settings-check fail/);
   assert.match(html, /&lt;img&gt;/);
   assert.doesNotMatch(html, /<img>/);
+});
+
+function pdfViewFixture(search) {
+  const page = fs.readFileSync(path.join(__dirname, '../app/static/pdf-view.html'), 'utf8');
+  const script = page.slice(page.indexOf('<script>') + 8, page.indexOf('</script>'));
+  const frame = { src: '', title: '', removed: false, remove() { this.removed = true; } };
+  const appended = [];
+  const c = vm.createContext({
+    URLSearchParams,
+    location: { search },
+    document: {
+      title: '',
+      body: { append(el) { appended.push(el.textContent); } },
+      createElement: () => ({ textContent: '' }),
+      getElementById: id => (id === 'pdf-frame' ? frame : null),
+    },
+  });
+  vm.runInContext(script, c);
+  return { c, frame, appended };
+}
+
+test('pdf viewer page titles the tab and only embeds internal PDF endpoints', () => {
+  const ok = pdfViewFixture('?title=2026-AAA-Liu-TDBA&src=' + encodeURIComponent('/api/pdf?token=t'));
+  assert.equal(ok.c.document.title, '2026-AAA-Liu-TDBA');
+  assert.equal(ok.frame.src, '/api/pdf?token=t');
+  assert.equal(ok.frame.removed, false);
+
+  const project = pdfViewFixture('?title=main.pdf&src=' + encodeURIComponent('/api/project/file?path=paper/main.pdf'));
+  assert.equal(project.frame.src, '/api/project/file?path=paper/main.pdf');
+
+  const bad = pdfViewFixture('?title=x&src=' + encodeURIComponent('https://example.com/a.pdf'));
+  assert.equal(bad.frame.removed, true);
+  assert.deepEqual(bad.appended, ['无效的预览地址']);
 });

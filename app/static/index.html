@@ -81,6 +81,10 @@
           <option value="">全部源码</option><option value="yes">有 TeX</option>
           <option value="no">无 TeX</option>
         </select>
+        <select id="sort-mode" aria-label="排序方式">
+          <option value="default">默认排序</option>
+          <option value="added">添加时间（新→旧）</option>
+        </select>
       </div>
       <label class="filter-toggle"><input type="checkbox" id="only-gaps"> 只看单边</label>
       <label class="filter-toggle"><input type="checkbox" id="only-starred"> 只看星标 <span id="star-count" class="muted"></span></label>
@@ -276,20 +280,6 @@
       <button id="topics-modal-close" class="mini ghost" autofocus>关闭</button>
     </div>
     <div id="topics-list" class="topics-list"></div>
-  </div>
-</dialog>
-
-<dialog id="pdf-modal" class="modal hidden" aria-labelledby="pdf-modal-title">
-  <div class="modal-box">
-    <div class="modal-head">
-      <span id="pdf-modal-title" class="slug"></span>
-      <button id="pdf-modal-tab" type="button" class="mini ghost">新标签页打开</button>
-      <button id="pdf-modal-close" class="mini ghost" autofocus>关闭</button>
-    </div>
-    <div class="preview-stack">
-      <div id="pdf-preview-status" class="preview-status"></div>
-      <iframe id="pdf-modal-frame" title="PDF 预览"></iframe>
-    </div>
   </div>
 </dialog>
 
