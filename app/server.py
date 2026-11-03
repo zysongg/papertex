@@ -441,6 +441,10 @@ def scan_local() -> dict:
                     hits = sorted(p for p in paper.glob("*.pdf") if p.is_file() and not p.is_symlink())
                     pdf_file = hits[0] if hits else None
                 known = titles.get(key) or {}
+                added_at = ""
+                if pdf_file is not None:
+                    added_at = datetime.fromtimestamp(
+                        pdf_file.stat().st_mtime, timezone.utc).isoformat()
                 papers[key] = {
                     "has_pdf": pdf_file is not None,
                     "pdf": pdf_file.name if pdf_file else "",
@@ -449,6 +453,7 @@ def scan_local() -> dict:
                     "title": known.get("title", ""),
                     "entry": "",
                     "venue": known.get("venue", ""),
+                    "added_at": added_at,
                 }
     return papers
 
@@ -472,7 +477,7 @@ def scan_remote(cache_titles: bool = True) -> dict:
         key = "/".join(parts[:3])
         item = papers.setdefault(key, {
             "has_pdf": False, "pdf": "", "has_source": False, "has_meta": False,
-            "title": "", "entry": "", "venue": "",
+            "title": "", "entry": "", "venue": "", "added_at": "",
         })
         if len(parts) >= 4:
             name = parts[3]
@@ -521,6 +526,7 @@ def scan_remote(cache_titles: bool = True) -> dict:
                     papers[cur]["code"] = meta.get("code", "")
                     papers[cur]["openreview"] = meta.get("openreview", "")
                     papers[cur]["doi"] = meta.get("doi", "")
+                    papers[cur]["added_at"] = meta.get("added_at") or meta.get("updated_at") or ""
                     if meta.get("pdf"):
                         papers[cur]["pdf"] = meta["pdf"]
                 cur = None
@@ -643,7 +649,7 @@ def library(source: str = "local"):
             "has_source": d["has_source"], "has_meta": d["has_meta"],
             "title": d.get("title", ""), "entry": d.get("entry", ""), "venue": d.get("venue", ""),
             "code": d.get("code", ""), "openreview": d.get("openreview", ""),
-            "doi": d.get("doi", ""),
+            "doi": d.get("doi", ""), "added_at": d.get("added_at", ""),
         })
     items.sort(key=lambda x: (x["topic"].lower(), x["year"], x["slug"]))
     return {"source": source, "count": len(items), "items": items}

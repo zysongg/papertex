@@ -523,7 +523,8 @@ class StorageTests(unittest.TestCase):
 
     def test_citation_batch_scan_retains_full_meta_without_cache_write(self):
         s = self.server
-        meta = dict(title='Batch', authors=['Full Name'], year=2025, doi='10.1234/test')
+        meta = dict(title='Batch', authors=['Full Name'], year=2025, doi='10.1234/test',
+                    added_at='2026-01-02T03:04:05+00:00')
         listing = f'{self.key}\td\n{self.key}/meta.json\tf\nTS/2026/not-a-directory\tf\n'
         output = f'__META__{self.key}/meta.json\n{json.dumps(meta)}\n__END__\n'
         with patch.object(s, 'ssh_need', side_effect=[
@@ -533,6 +534,7 @@ class StorageTests(unittest.TestCase):
             papers = self.actual_scan_remote(cache_titles=False)
         self.assertEqual(runner.call_count, 2)
         self.assertEqual(papers[self.key]['_citation_meta'], meta)
+        self.assertEqual(papers[self.key]['added_at'], '2026-01-02T03:04:05+00:00')
         self.assertNotIn('TS/2026/not-a-directory', papers)
         self.assertFalse(s.titles_file().exists())
 
@@ -1005,6 +1007,20 @@ class StorageTests(unittest.TestCase):
         self.assertEqual((item['title'], item['venue']), ('Cached Title', 'ICML'))
         self.assertFalse(item['has_meta'])
         self.assertEqual(item['pdf'], self.slug + '.pdf')
+
+    def test_library_exposes_added_at_from_meta_and_local_mtime(self):
+        meta = self.seed()
+        meta['added_at'] = '2026-01-02T03:04:05+00:00'
+        (self.paper / 'meta.json').write_text(json.dumps(meta))
+        remote = self.server.library('remote')['items']
+        self.assertEqual(remote[0]['added_at'], '2026-01-02T03:04:05+00:00')
+        local = self.local / self.key
+        local.mkdir(parents=True)
+        pdf = local / (self.slug + '.pdf')
+        pdf.write_bytes(b'%PDF-1.4 local')
+        os.utime(pdf, (1700000000, 1700000000))
+        self.assertEqual(self.server.library('local')['items'][0]['added_at'],
+                         '2023-11-14T22:13:20+00:00')
 
     def test_local_scan_survives_broken_title_cache(self):
         self.seed()
