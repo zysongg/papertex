@@ -1,6 +1,7 @@
 import base64
 import fcntl
 import hashlib
+import html
 import json
 import os
 import re
@@ -17,6 +18,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from functools import wraps
 from pathlib import Path, PurePosixPath
 from typing import Optional
@@ -35,6 +37,7 @@ from ingest import (
 import knowledge as kb
 import ieee as ieee_xplore
 import openreview as orx
+import review as rv
 import settings as config_store
 from request_security import LocalRequestGuard, validate_bind_host
 from operation_progress import get_progress, tracked_operation, update_progress
@@ -43,6 +46,7 @@ BASE = Path(__file__).resolve().parent.parent
 CONFIG_FILE = BASE / "config" / "config.json"
 CFG = config_store.load(CONFIG_FILE)
 LIB_LOCAL = Path(os.path.expanduser(CFG["local_library"]))
+REVIEW_LOCAL = Path(os.path.expanduser(CFG.get("review_space") or "~/ReviewSpace"))
 LIB_REMOTE = CFG["remote_library"].rstrip("/")
 WORKSHOP = CFG.get("remote_workshop", "").rstrip("/")
 REMOTE_NAME = CFG.get("remote_name") or "远端服务器"
@@ -56,6 +60,9 @@ SEG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SLUG = re.compile(r"^\d{4}-[A-Za-z0-9]+-[A-Za-z0-9][A-Za-z0-9-]*$")
 YEAR = re.compile(r"^\d{4}$")
 KNOWLEDGE_KEY = re.compile(r"^_knowledge/[0-9a-f]{32}$")
+NOTE_NAME = "note.md"
+NOTE_LIMIT = 200_000
+NOTE_REVISION = re.compile(r"^[0-9a-f]{64}$")
 ARXIV_VENUE = re.compile(
     r"\b(ICML|ICLR|NeurIPS|NIPS|AAAI|IJCAI|KDD|WWW|CVPR|ICCV|ECCV|ACL|EMNLP|NAACL|"
     r"SIGIR|CIKM|ICDM|ICDE|SIGMOD|VLDB|TSP|TKDE|TNNLS|TPAMI|TCOM|TWC|IoTJ)\b"
@@ -73,6 +80,7 @@ PROJECT_VIEW_TYPES = {
     "jpg": ("jpg", "jpeg"),
     "webp": ("webp",),
     "gif": ("gif",),
+    "md": ("md", "markdown"),
 }
 PROJECT_FILE_TYPES = {
     "pdf": "application/pdf",
@@ -91,8 +99,15 @@ PROJECT_RECENT_PRUNE = (
 PROJECT_LISTING_LIMIT = 2 * 1024 * 1024
 PROJECT_MAX_ENTRIES = 2000
 PROJECT_MAX_FILE_BYTES = 100 * 1024 * 1024
+PROJECT_MARKDOWN_MAX_BYTES = 512 * 1024
 
 validate_bind_host(CFG.get("host", "127.0.0.1"))
+_resolved_lib = LIB_LOCAL.resolve()
+_resolved_review = REVIEW_LOCAL.resolve()
+if (_resolved_review == _resolved_lib or _resolved_lib.is_relative_to(_resolved_review)
+        or _resolved_review.is_relative_to(_resolved_lib)
+        or Path.home().resolve().is_relative_to(_resolved_review)):
+    raise ValueError("审稿目录必须是论文库之外的独立目录")
 if REMOTE_CONFIGURED:
     for configured_path in (LIB_REMOTE, WORKSHOP):
         if (not configured_path.startswith("/") or configured_path == "/"
@@ -445,11 +460,13 @@ def scan_local() -> dict:
                 if pdf_file is not None:
                     added_at = datetime.fromtimestamp(
                         pdf_file.stat().st_mtime, timezone.utc).isoformat()
+                note_file = paper / NOTE_NAME
                 papers[key] = {
                     "has_pdf": pdf_file is not None,
                     "pdf": pdf_file.name if pdf_file else "",
                     "has_source": False,
                     "has_meta": False,
+                    "has_note": note_file.is_file() and not note_file.is_symlink(),
                     "title": known.get("title", ""),
                     "entry": "",
                     "venue": known.get("venue", ""),
@@ -463,12 +480,12 @@ def scan_remote(cache_titles: bool = True) -> dict:
     papers = {}
     p = ssh_need(remote_guard(LIB_REMOTE) +
         f"if [ ! -e {q(LIB_REMOTE)} ]; then exit 0; fi; cd {q(LIB_REMOTE)} || exit 1; "
-        "find . -mindepth 3 -maxdepth 4 -printf '%P\\t%y\\n'"
+        "find . -mindepth 3 -maxdepth 4 -printf '%P\\t%y\\t%s\\n'"
     )
     for line in p.stdout.splitlines():
-        if "\t" not in line:
+        if line.count("\t") < 2:
             continue
-        rel, _kind = line.rsplit("\t", 1)
+        rel, _kind, _size = line.rsplit("\t", 2)
         parts = rel.split("/")
         if (parts[0] == kb.KNOWLEDGE_DIR or _kind == "l" or len(parts) < 3
                 or (len(parts) == 3 and _kind != "d")
@@ -477,7 +494,7 @@ def scan_remote(cache_titles: bool = True) -> dict:
         key = "/".join(parts[:3])
         item = papers.setdefault(key, {
             "has_pdf": False, "pdf": "", "has_source": False, "has_meta": False,
-            "title": "", "entry": "", "venue": "", "added_at": "",
+            "has_note": False, "title": "", "entry": "", "venue": "", "added_at": "",
         })
         if len(parts) >= 4:
             name = parts[3]
@@ -488,6 +505,8 @@ def scan_remote(cache_titles: bool = True) -> dict:
                 item["has_source"] = True
             elif name == "meta.json":
                 item["has_meta"] = True
+            elif name == NOTE_NAME and _kind == "f":
+                item["has_note"] = _size.isdigit() and int(_size) > 0
 
     if papers:
         meta_cmd = (
@@ -647,6 +666,7 @@ def library(source: str = "local"):
             "key": key, "topic": topic, "year": year, "slug": slug,
             "has_pdf": d["has_pdf"], "pdf": d.get("pdf", ""),
             "has_source": d["has_source"], "has_meta": d["has_meta"],
+            "has_note": d.get("has_note", False),
             "title": d.get("title", ""), "entry": d.get("entry", ""), "venue": d.get("venue", ""),
             "code": d.get("code", ""), "openreview": d.get("openreview", ""),
             "doi": d.get("doi", ""), "added_at": d.get("added_at", ""),
@@ -674,7 +694,7 @@ def options(force: bool = False):
         papers.setdefault(topic, {}).setdefault(year, set()).add(slug)
     topics = []
     venues = set()
-    for topic, years in sorted(papers.items()):
+    for topic, years in sorted(papers.items(), key=lambda kv: kv[0].lower()):
         topics.append({
             "name": topic,
             "count": sum(len(v) for v in years.values()),
@@ -960,19 +980,94 @@ def _venue_year(text: str, fallback_year: int) -> tuple:
     return venue, int(hit.group(2)) if hit.group(2) else fallback_year
 
 
+def _arxiv_page_text(fragment: str) -> str:
+    return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", fragment)).split())
+
+
+def arxiv_abs_lookup(aid: str) -> dict:
+    raw = _arxiv_http("https://arxiv.org/abs/" + aid, timeout=45)
+    page = raw.decode("utf-8", "replace")
+
+    def grab(pattern: str) -> str:
+        found = re.search(pattern, page, re.S)
+        return found.group(1) if found else ""
+
+    title = re.sub(r"^Title:\s*", "", _arxiv_page_text(
+        grab(r'<h1[^>]*class="[^"]*\btitle\b[^"]*"[^>]*>(.*?)</h1>')))
+    if not title:
+        raise HTTPException(502, "arXiv 摘要页缺少标题")
+    authors_html = grab(r'<div[^>]*class="[^"]*\bauthors\b[^"]*"[^>]*>(.*?)</div>')
+    authors = [_arxiv_page_text(a) for a in re.findall(r"<a[^>]*>(.*?)</a>", authors_html, re.S)]
+    authors = [a for a in authors if a]
+    if not authors:
+        raw_authors = re.sub(r"^Authors:\s*", "", _arxiv_page_text(authors_html))
+        authors = [a.strip() for a in raw_authors.split(",") if a.strip()]
+    comment = _arxiv_page_text(grab(r'<td[^>]*class="[^"]*\bcomments\b[^"]*"[^>]*>(.*?)</td>'))
+    journal = _arxiv_page_text(grab(r'<td[^>]*class="[^"]*\bjref\b[^"]*"[^>]*>(.*?)</td>'))
+    subject = _arxiv_page_text(grab(r'<span[^>]*class="[^"]*primary-subject[^"]*"[^>]*>(.*?)</span>'))
+    history = grab(r'<div[^>]*class="[^"]*submission-history[^"]*"[^>]*>(.*?)</div>')
+    date_match = re.search(
+        r"([A-Z][a-z]{2}, \d{1,2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} UTC)", history)
+    published = ""
+    year = datetime.now().year
+    if date_match:
+        try:
+            moment = parsedate_to_datetime(date_match.group(1)).astimezone(timezone.utc)
+            published = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+            year = moment.year
+        except (TypeError, ValueError):
+            published = ""
+    venue, venue_year = "arXiv", year
+    hit = ARXIV_VENUE.search(comment) or ARXIV_VENUE.search(journal) or ARXIV_VENUE.search(title)
+    if hit:
+        venue = {"NIPS": "NeurIPS"}.get(hit.group(1).upper(), hit.group(1))
+        if hit.group(2):
+            venue_year = int(hit.group(2))
+    category_match = re.search(r"\(([^()]+)\)\s*$", subject)
+    category = category_match.group(1).strip() if category_match else ""
+    family = _arxiv_slug_word(authors[0].split()[-1]) if authors else ""
+    return {
+        "arxiv_id": aid,
+        "title": title,
+        "authors": authors,
+        "author": family,
+        "keyword": _slug_keyword(title),
+        "year": venue_year,
+        "venue": venue,
+        "comment": comment,
+        "journal_ref": journal,
+        "category": category,
+        "published": published,
+        "abs": f"https://arxiv.org/abs/{aid}",
+    }
+
+
+_ARXIV_API_BLOCKED_UNTIL = 0.0
+
+
 def arxiv_lookup(aid: str) -> dict:
+    global _ARXIV_API_BLOCKED_UNTIL
     raw = None
     last = None
-    for attempt, base in enumerate(("https://export.arxiv.org/api/query", "https://arxiv.org/api/query"), 1):
-        message = f"获取 arXiv 元数据（来源 {attempt}/2）"
-        try:
-            raw = _arxiv_http(f"{base}?id_list={urllib.parse.quote(aid)}", timeout=45,
-                              progress=lambda **details: update_progress(message, attempt=attempt, **details))
-            break
-        except HTTPException as e:
-            last = e
+    if time.monotonic() >= _ARXIV_API_BLOCKED_UNTIL:
+        for attempt, base in enumerate(("https://export.arxiv.org/api/query", "https://arxiv.org/api/query"), 1):
+            message = f"获取 arXiv 元数据（来源 {attempt}/2）"
+            try:
+                raw = _arxiv_http(f"{base}?id_list={urllib.parse.quote(aid)}", timeout=45,
+                                  progress=lambda **details: update_progress(message, attempt=attempt, **details))
+                break
+            except HTTPException as e:
+                last = e
+                if e.status_code == 503 and "过于频繁" in str(e.detail):
+                    _ARXIV_API_BLOCKED_UNTIL = time.monotonic() + 300
+                    break
     if raw is None:
-        raise HTTPException(502, f"arXiv 元数据获取失败: {last.detail if last else ''}")
+        try:
+            return arxiv_abs_lookup(aid)
+        except HTTPException as fallback:
+            if fallback.status_code == 404:
+                raise
+            raise HTTPException(502, f"arXiv 元数据获取失败: {last.detail if last else fallback.detail}")
     try:
         root = ET.fromstring(raw)
     except Exception:
@@ -1023,10 +1118,28 @@ async def operation_status(operation_id: str):
     return get_progress(operation_id)
 
 
+def arxiv_bibtex(aid: str) -> str:
+    update_progress("读取 arXiv BibTeX")
+    data = _arxiv_http(
+        f"https://arxiv.org/bibtex/{aid}", timeout=45, limit=128 * 1024,
+        progress=lambda **details: update_progress("读取 arXiv BibTeX", **details),
+    )
+    text = data.decode("utf-8", "replace").strip()
+    if not text.startswith("@"):
+        raise HTTPException(502, "arXiv BibTeX 返回格式异常")
+    return text[:20000]
+
+
 @app.get("/api/arxiv/preview")
 @tracked_operation
 def arxiv_preview(url: str, operation_id: Optional[str] = None):
-    return arxiv_lookup(arxiv_id(url))
+    aid = arxiv_id(url)
+    info = arxiv_lookup(aid)
+    try:
+        info["bibtex"] = arxiv_bibtex(aid)
+    except HTTPException:
+        info["bibtex"] = ""
+    return info
 
 
 def arxiv_pdf_bytes(aid: str) -> bytes:
@@ -1062,6 +1175,12 @@ def openreview_lookup(url: str) -> dict:
     if not venue:
         venue, venue_year = _venue_year(info.get("title", ""), fallback)
     authors = info.get("authors") or []
+    bibtex = info.get("bibtex", "")
+    if not bibtex and info.get("arxiv_id"):
+        try:
+            bibtex = arxiv_bibtex(info["arxiv_id"])
+        except HTTPException:
+            bibtex = ""
     return {
         "openreview_id": info["openreview_id"],
         "openreview_url": info["openreview_url"],
@@ -1073,7 +1192,7 @@ def openreview_lookup(url: str) -> dict:
         "venue": venue or "OpenReview",
         "venue_raw": info.get("venue", ""),
         "arxiv_id": info.get("arxiv_id", ""),
-        "bibtex": info.get("bibtex", ""),
+        "bibtex": bibtex,
         "abstract": info.get("abstract", ""),
     }
 
@@ -1118,7 +1237,13 @@ def ieee_lookup(ref: str) -> dict:
 @app.get("/api/ieee/preview")
 @tracked_operation
 def ieee_preview(ref: str, operation_id: Optional[str] = None):
-    return ieee_lookup(ref)
+    info = ieee_lookup(ref)
+    if info.get("doi"):
+        try:
+            info["bibtex"] = ieee_xplore.bibtex(info["doi"], progress=update_progress)
+        except HTTPException:
+            info["bibtex"] = ""
+    return info
 
 
 def norm_title(text: str) -> str:
@@ -1795,6 +1920,183 @@ def get_meta(topic: str, year: str, slug: str):
     return read_meta(remote_dir(topic, year, slug))
 
 
+# ---------- 论文笔记（note.md） ----------
+
+def note_digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def local_note_path(topic: str, year: str, slug: str) -> Path:
+    return local_path(topic, year, slug, NOTE_NAME)
+
+
+def read_local_note(path: Path) -> Optional[str]:
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def read_remote_note(path: str):
+    """Return (text, digest) or (None, "missing") for a small remote text file."""
+    p = ssh_run(remote_guard(path) +
+                f"if [ ! -e {q(path)} ]; then exit 44; fi; "
+                f"if [ ! -f {q(path)} ]; then exit 45; fi; "
+                f"head -c {NOTE_LIMIT + 1} -- {q(path)}", binary=True)
+    if p.returncode == 44:
+        return None, "missing"
+    if p.returncode == 45:
+        raise HTTPException(409, f"笔记路径不是普通文件: {path}")
+    if p.returncode != 0:
+        raise HTTPException(502, f"读取远端笔记失败: {path}")
+    data = p.stdout or b""
+    if len(data) > NOTE_LIMIT:
+        raise HTTPException(413, f"远端笔记超过 {NOTE_LIMIT} 字节，请先在服务器上精简")
+    try:
+        return data.decode("utf-8"), hashlib.sha256(data).hexdigest()
+    except UnicodeDecodeError:
+        raise HTTPException(500, "远端笔记不是 UTF-8 文本，未做任何修改")
+
+
+def delete_remote_note(path: str, expected: str):
+    script = (remote_guard(path) + "set -e; "
+              f"test -f {q(path)} || exit 75; "
+              f"actual=$(sha256sum -- {q(path)}) || exit 1; "
+              f"[ \"${{actual%% *}}\" = {q(expected)} ] || exit 75; "
+              f"rm -f -- {q(path)}")
+    p = ssh_run(script)
+    if p.returncode == 75:
+        raise HTTPException(409, "远端笔记已被其他操作修改，请刷新后重试")
+    if p.returncode != 0:
+        raise HTTPException(502, f"删除远端笔记失败: {path}")
+
+
+def note_payload_note(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return research_text(text, NOTE_LIMIT, "笔记")
+
+
+def note_size(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+@app.get("/api/paper/note")
+def get_paper_note(topic: str, year: str, slug: str):
+    for value in (topic, year, slug):
+        seg(value)
+    local_text = read_local_note(local_note_path(topic, year, slug))
+    path = remote_dir(topic, year, slug) + "/" + NOTE_NAME
+    try:
+        text, revision = read_remote_note(path)
+    except HTTPException as exc:
+        if exc.status_code not in (502, 504) or local_text is None:
+            raise
+        return {"text": local_text, "revision": note_digest(local_text), "source": "local",
+                "has_note": bool(local_text.strip()), "byte_size": note_size(local_text),
+                "remote_error": str(exc.detail)}
+    text = text or ""
+    return {"text": text, "revision": revision, "source": "remote",
+            "has_note": bool(text.strip()), "byte_size": note_size(text),
+            "recovery_text": local_text if revision == "missing" and local_text else ""}
+
+
+@app.post("/api/paper/note")
+@tracked_operation
+@serialized_write
+def save_paper_note(payload: dict, operation_id: Optional[str] = None):
+    topic = str(payload.get("topic", ""))
+    year = str(payload.get("year", ""))
+    slug = str(payload.get("slug", ""))
+    for value in (topic, year, slug):
+        seg(value)
+    if not isinstance(payload.get("text"), str):
+        raise HTTPException(400, "text 必须是字符串")
+    text = note_payload_note(payload["text"])
+    revision = payload.get("revision")
+    if not isinstance(revision, str) or (revision != "missing" and not NOTE_REVISION.fullmatch(revision)):
+        raise HTTPException(400, "revision 必须是 missing 或 64 位 hex")
+    rdir = remote_dir(topic, year, slug)
+    if not remote_exists(rdir, "d"):
+        raise HTTPException(404, "远端没有这篇论文的目录，无法保存笔记")
+    path = rdir + "/" + NOTE_NAME
+    empty = not text.strip()
+    if empty:
+        if revision == "missing":
+            current, _ = read_remote_note(path)
+            if current is not None:
+                raise HTTPException(409, "远端笔记已被其他操作创建，请刷新后重试")
+        else:
+            delete_remote_note(path, revision)
+        text, revision = "", "missing"
+    else:
+        if not text.endswith("\n"):
+            text += "\n"
+        write_remote_text(path, text, expected=revision)
+        revision = note_digest(text)
+    warnings = []
+    local = local_note_path(topic, year, slug)
+    if local.parent.is_dir():
+        try:
+            if empty:
+                if local.is_symlink() or local.is_file():
+                    local.unlink()
+            elif local.is_symlink() or local.is_dir():
+                raise OSError("本机笔记路径被占用")
+            else:
+                write_local_text(local, text)
+        except OSError as exc:
+            warnings.append(f"远端笔记已保存，本机镜像未更新：{exc}")
+    return {"ok": True, "text": text, "revision": revision, "has_note": not empty,
+            "byte_size": note_size(text), "warnings": warnings}
+
+
+def ensure_paper_note_local(topic: str, year: str, slug: str):
+    note = local_note_path(topic, year, slug)
+    local_text = read_local_note(note)
+    path = remote_dir(topic, year, slug) + "/" + NOTE_NAME
+    try:
+        text, _ = read_remote_note(path)
+    except HTTPException as exc:
+        if exc.status_code not in (502, 504) or local_text is None:
+            raise
+        return note, "local"
+    if not (text or "").strip():
+        # 远端为空时保留本机草稿，不让打开动作把未同步的编辑覆盖掉
+        if not (local_text or "").strip():
+            raise HTTPException(404, "这篇论文还没有笔记，请先在网页里写一条")
+        return note, "local"
+    if local_text == text:
+        return note, "local"
+    try:
+        write_local_text(note, text)
+    except (OSError, HTTPException) as exc:
+        raise HTTPException(500, "本机镜像写入失败，无法用本地软件打开") from exc
+    return note, "pulled"
+
+
+@app.post("/api/paper/note/open", dependencies=[Depends(consume_write_body)])
+@serialized_write
+def open_paper_note_local(topic: str, year: str, slug: str):
+    if sys.platform == "darwin":
+        opener = "open"
+    elif sys.platform.startswith("linux"):
+        opener = "xdg-open"
+    else:
+        raise HTTPException(400, "当前系统不支持用本地软件打开")
+    for value in (topic, year, slug):
+        seg(value)
+    note, source = ensure_paper_note_local(topic, year, slug)
+    try:
+        subprocess.Popen([opener, str(note)], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, close_fds=True)
+    except OSError as exc:
+        raise HTTPException(500, "无法启动本地软件") from exc
+    return {"ok": True, "path": str(note), "source": source, "notice": "已用本地软件打开"}
+
+
 @app.post("/api/paper/edit")
 @tracked_operation
 @serialized_write
@@ -2048,11 +2350,13 @@ def read_research() -> dict:
         for key, record in data["papers"].items():
             research_key(key)
             if not isinstance(record, dict) or set(record) - {
-                    "status", "note", "bibliography", "cite_key", "version_group", "version_label"}:
+                    "status", "note", "bibliography", "cite_key", "version_group",
+                    "version_label", "tags"}:
                 raise ValueError("record")
             if record.get("status", "") not in RESEARCH_STATUSES:
                 raise ValueError("status")
             research_text(record.get("note", ""), 1000, "note")
+            kb.tags_list(record.get("tags", []))
             bibliography_fields(record.get("bibliography", {}))
             if "cite_key" in record and (not isinstance(record["cite_key"], str)
                     or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,79}", record["cite_key"])):
@@ -2131,6 +2435,24 @@ def set_citation(payload: dict):
     require_research_paper(key)
     state["items"].setdefault(key, {}).setdefault("bibliography", {}).update(fields)
     return save_research(state)
+
+
+@app.post("/api/tags")
+@serialized_write
+def set_paper_tags(payload: dict):
+    key = research_key(payload.get("key"))
+    try:
+        tags = kb.tags_list(payload.get("tags"))
+    except kb.KnowledgeError as exc:
+        raise HTTPException(400, exc.message)
+    state = research_for_write(payload)
+    require_research_paper(key)
+    record = state["items"].setdefault(key, {})
+    if tags:
+        record["tags"] = tags
+    else:
+        record.pop("tags", None)
+    return dict(save_research(state), ok=True, tags=tags)
 
 
 def bibtex_escape(value: str) -> str:
@@ -2483,7 +2805,8 @@ def read_knowledge_local(item_id: str):
     return item
 
 
-def read_knowledge_remote(item_id: str):
+def read_knowledge_remote_state(item_id: str):
+    """Read a remote knowledge item together with the meta.json revision."""
     folder = knowledge_remote_dir(item_id)
     meta_path = folder + "/meta.json"
     note_path = folder + "/note.md"
@@ -2496,22 +2819,22 @@ def read_knowledge_remote(item_id: str):
     )
     p = ssh_run(script, timeout=30)
     if p.returncode == 44:
-        return None
+        return None, "missing"
     if p.returncode != 0:
         raise HTTPException(502, "读取远端资料失败")
     lines = p.stdout.splitlines()
     if not lines:
-        return None
+        return None, "missing"
     try:
         raw = base64.b64decode(lines[0], validate=True)
         if len(raw) > kb.MAX_META_BYTES:
-            return None
+            return None, "missing"
         data = json.loads(raw.decode("utf-8"))
     except (ValueError, TypeError, UnicodeDecodeError):
-        return None
+        return None, "missing"
     item = kb.parse_meta(data, item_id)
     if item is None:
-        return None
+        return None, "missing"
     body = ""
     if len(lines) > 1 and lines[1]:
         try:
@@ -2519,7 +2842,85 @@ def read_knowledge_remote(item_id: str):
         except (ValueError, TypeError, UnicodeDecodeError):
             body = ""
     item["body"] = body[:kb.MAX_BODY]
-    return item
+    return item, hashlib.sha256(raw).hexdigest()
+
+
+def read_knowledge_remote(item_id: str):
+    return read_knowledge_remote_state(item_id)[0]
+
+
+def knowledge_body_digest(body: str) -> str:
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def knowledge_meta_from_item(item: dict) -> dict:
+    return {
+        "kind": item["kind"], "title": item["title"], "url": item["url"],
+        "source": item["source"], "tags": list(item["tags"]),
+        "has_body": bool(item["body"].strip()),
+        "created_at": item["created_at"], "updated_at": item["updated_at"],
+    }
+
+
+def knowledge_local_edit(item_id: str, remote_item: dict):
+    """Return the local note.md draft when it differs from 远端 and was edited here.
+
+    The mirror meta records the digest of the body that was last synced.  A local
+    file whose digest no longer matches that baseline was edited on this machine;
+    if the 远端 digest also moved away from the baseline, both sides changed.
+    """
+    if remote_item["kind"] != "note":
+        return None
+    local = read_knowledge_local(item_id)
+    if local is None or local["body"] == remote_item["body"]:
+        return None
+    folder = knowledge_local_dir(item_id)
+    note = folder / "note.md"
+    meta_path = folder / "meta.json"
+    try:
+        if note.is_symlink() or not note.is_file():
+            return None
+        stat = note.stat()
+    except OSError:
+        return None
+    modified = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+    modified_at = modified.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    def draft(body, conflict, reason=""):
+        return {"body": body[:kb.MAX_BODY], "size": stat.st_size,
+                "modified_at": modified_at, "conflict": conflict, "reason": reason}
+
+    if stat.st_size > kb.MAX_BODY * 4 + 8:
+        return draft(local["body"], True, "本机 note.md 过大，未自动写回")
+    try:
+        raw = note.read_bytes()
+    except OSError:
+        return None
+    try:
+        local_body = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return draft("", True, "本机 note.md 不是 UTF-8 文本，未自动写回")
+    if local_body == remote_item["body"]:
+        return None
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    baseline = data.get("body_sha256") if isinstance(data, dict) else None
+    if isinstance(baseline, str) and baseline:
+        if knowledge_body_digest(local_body) == baseline:
+            # 本机镜像没动过，只是远端有了新版本
+            return None
+        conflict = knowledge_body_digest(remote_item["body"]) != baseline
+    else:
+        synced_at = data.get("updated_at") if isinstance(data, dict) else ""
+        conflict = synced_at != remote_item["updated_at"]
+    return {
+        "body": local_body[:kb.MAX_BODY],
+        "size": len(raw),
+        "modified_at": modified.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "conflict": conflict,
+    }
 
 
 def knowledge_fields(payload) -> dict:
@@ -2543,7 +2944,9 @@ def mirror_knowledge_local(item_id: str, fields: dict, meta: dict) -> list:
     try:
         folder = knowledge_local_dir(item_id, create=True)
         write_local_text(folder / "note.md", fields["body"])
-        write_local_json(folder / "meta.json", meta)
+        local_meta = dict(meta)
+        local_meta["body_sha256"] = knowledge_body_digest(fields["body"])
+        write_local_json(folder / "meta.json", local_meta)
         return []
     except (OSError, HTTPException):
         return ["资料已保存到远端，但本机镜像写入失败"]
@@ -2567,10 +2970,12 @@ def knowledge_detail(item_id: str):
         item = read_knowledge_local(item_id)
         if item is None:
             raise HTTPException(502, f"远端读取失败，本机没有这篇资料: {exc.detail}") from exc
-        return {"item": item, "source": "local", "remote_error": str(exc.detail)}
+        return {"item": item, "source": "local", "remote_error": str(exc.detail),
+                "local_edit": None}
     if item is None:
         raise HTTPException(404, "资料不存在")
-    return {"item": item, "source": "remote", "remote_error": ""}
+    return {"item": item, "source": "remote", "remote_error": "",
+            "local_edit": knowledge_local_edit(item_id, item)}
 
 
 @app.post("/api/knowledge")
@@ -2612,25 +3017,92 @@ def ensure_knowledge_local_note(item_id: str):
     if local is not None and local["kind"] != "note":
         raise HTTPException(400, "链接资料没有 Markdown 文件，请用网页打开")
     if local is not None and note.is_file() and not note.is_symlink():
+        try:
+            item = read_knowledge_remote(item_id)
+        except HTTPException as exc:
+            if exc.status_code in (502, 504):
+                return note, "local"
+            raise
+        if item is None:
+            return note, "local"
+        if item["kind"] != "note":
+            raise HTTPException(400, "链接资料没有 Markdown 文件，请用网页打开")
+        if knowledge_local_edit(item_id, item) is not None:
+            # 本机有未同步的修改，不能用远端内容覆盖
+            return note, "local"
+        if local["body"] != item["body"]:
+            warnings = mirror_knowledge_local(item_id, {"body": item["body"]},
+                                              knowledge_meta_from_item(item))
+            if warnings:
+                raise HTTPException(500, warnings[0])
+            return note, "pulled"
         return note, "local"
     item = read_knowledge_remote(item_id)
     if item is None:
         raise HTTPException(404, "资料不存在")
     if item["kind"] != "note":
         raise HTTPException(400, "链接资料没有 Markdown 文件，请用网页打开")
-    meta = {
-        "kind": item["kind"], "title": item["title"], "url": item["url"],
-        "source": item["source"], "tags": list(item["tags"]),
-        "has_body": bool(item["body"].strip()),
-        "created_at": item["created_at"], "updated_at": item["updated_at"],
-    }
-    try:
-        knowledge_local_dir(item_id, create=True)
-        write_local_text(note, item["body"])
-        write_local_json(folder / "meta.json", meta)
-    except (OSError, HTTPException) as exc:
-        raise HTTPException(500, "本机镜像写入失败，无法用本地软件打开") from exc
+    warnings = mirror_knowledge_local(item_id, {"body": item["body"]},
+                                      knowledge_meta_from_item(item))
+    if warnings:
+        raise HTTPException(500, "本机镜像写入失败，无法用本地软件打开")
     return note, "pulled"
+
+
+@app.post("/api/knowledge/{item_id}/sync-local",
+          dependencies=[Depends(consume_write_body)])
+@serialized_write
+def sync_knowledge_local(item_id: str, mode: str = "push", overwrite: bool = False):
+    if mode not in ("push", "pull"):
+        raise HTTPException(400, "mode 只能是 push 或 pull")
+    item, revision = read_knowledge_remote_state(item_id)
+    if item is None:
+        raise HTTPException(404, "资料不存在")
+    if item["kind"] != "note":
+        raise HTTPException(400, "链接资料没有 Markdown 文件")
+    if mode == "pull":
+        warnings = mirror_knowledge_local(item_id, {"body": item["body"]},
+                                          knowledge_meta_from_item(item))
+        if warnings:
+            raise HTTPException(500, warnings[0])
+        return {"ok": True, "item": item, "mode": "pull", "changed": True,
+                "warnings": [], "notice": "已放弃本机修改，载入远端版本"}
+    edit = knowledge_local_edit(item_id, item)
+    if edit is None:
+        return {"ok": True, "item": item, "mode": "push", "changed": False,
+                "warnings": [], "notice": "本机 note.md 与远端一致"}
+    if edit["conflict"] and not overwrite:
+        raise HTTPException(409, "远端资料已有更新，本机修改未写回；可覆盖远端或放弃本机修改")
+    folder = knowledge_local_dir(item_id)
+    note = folder / "note.md"
+    try:
+        raw = note.read_bytes()
+    except OSError as exc:
+        raise HTTPException(500, "读取本机 note.md 失败") from exc
+    if len(raw) > kb.MAX_BODY * 4 + 8:
+        raise HTTPException(400, "本机 note.md 过大，未写回远端")
+    try:
+        body = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(400, "本机 note.md 不是 UTF-8 文本，未写回远端") from exc
+    if len(body) > kb.MAX_BODY:
+        raise HTTPException(400, f"本机 note.md 超过 {kb.MAX_BODY} 个字符，未写回远端")
+    fields = knowledge_fields({
+        "kind": "note", "title": item["title"], "url": item["url"],
+        "source": item["source"], "tags": list(item["tags"]), "body": body,
+    })
+    update_progress("写回本机修改")
+    meta = write_knowledge_remote(item_id, fields,
+                                  existing={"created_at": item["created_at"]},
+                                  expected=revision)
+    warnings = mirror_knowledge_local(item_id, fields, meta)
+    new_item = kb.parse_meta(meta, item_id)
+    new_item["body"] = fields["body"]
+    touched, project_errors = sync_projects_for_knowledge(item_id, new_item)
+    warnings.extend(project_errors)
+    return {"ok": True, "item": new_item, "mode": "push", "changed": True,
+            "projects_updated": touched, "warnings": warnings,
+            "notice": "已把本机 note.md 写回远端"}
 
 
 @app.post("/api/knowledge/{item_id}/open", dependencies=[Depends(consume_write_body)])
@@ -3487,12 +3959,7 @@ def write_local_document(path: Path, text: str, expected: Optional[str] = None) 
             tmp.unlink(missing_ok=True)
 
 
-def read_refs_doc(project: str, source: str = "remote"):
-    update_progress(f"读取{source_label(source)}项目引用：{project}")
-    if source == "local":
-        doc, revision = read_local_document(refs_file(project, source))
-    else:
-        doc, revision = read_remote_json(refs_file(project, source))
+def parse_refs_document(doc, revision, project: str, source: str = "remote"):
     if revision == "missing":
         return RefsDocument(refs_ordered({"references": []}, source), revision), False
     if not isinstance(doc, dict) or not isinstance(doc.get("references"), list):
@@ -3517,6 +3984,15 @@ def read_refs_doc(project: str, source: str = "remote"):
     doc["library"] = project_library(source)
     doc["read_order"] = list(REFS_READ_ORDER)
     return RefsDocument(refs_ordered(doc, source), revision), True
+
+
+def read_refs_doc(project: str, source: str = "remote"):
+    update_progress(f"读取{source_label(source)}项目引用：{project}")
+    if source == "local":
+        doc, revision = read_local_document(refs_file(project, source))
+    else:
+        doc, revision = read_remote_json(refs_file(project, source))
+    return parse_refs_document(doc, revision, project, source)
 
 
 def write_refs_doc(project: str, doc: RefsDocument, source: str = "remote") -> None:
@@ -3989,18 +4465,74 @@ def delete_topic(topic: str, confirm: str, operation_id: Optional[str] = None):
             "notice": "主题已移入回收区（不会自动清理）。项目引用保留并标记缺失。"}
 
 
+def parse_project_stream(text: str) -> dict:
+    states = {}
+    current = None
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        if line.startswith("__PROJECT__"):
+            rel, _, flag = line[len("__PROJECT__"):].partition("\t")
+            states[rel] = {"exists": flag == "yes", "has_refs": False, "text": ""}
+            current = rel
+        elif line == "__REFS__" and current is not None:
+            buf = []
+            while i < len(lines) and lines[i] != "__ENDREFS__":
+                buf.append(lines[i])
+                i += 1
+            if i < len(lines):
+                i += 1
+            states[current]["has_refs"] = True
+            states[current]["text"] = "\n".join(buf)
+    return states
+
+
+def remote_project_states(rels: list) -> dict:
+    guards = [remote_guard(f"{WORKSHOP}/{rel}") for rel in rels]
+    guards += [remote_guard(f"{WORKSHOP}/{rel}/reference-tex.json") for rel in rels]
+    script = "".join(guards)
+    for rel in rels:
+        root = f"{WORKSHOP}/{rel}"
+        refs = root + "/reference-tex.json"
+        script += (f"printf '__PROJECT__%s\\t' {q(rel)}; "
+                   f"if [ -d {q(root)} ]; then printf 'yes'; else printf 'no'; fi; printf '\\n'; "
+                   f"if [ -f {q(refs)} ]; then printf '__REFS__\\n'; cat -- {q(refs)}; "
+                   f"printf '\\n__ENDREFS__\\n'; fi; ")
+    p = ssh_run(script, timeout=120)
+    if p.returncode != 0:
+        raise HTTPException(502, f"读取远端项目失败: {p.stderr.strip()[:300] or '命令退出异常'}")
+    return parse_project_stream(p.stdout)
+
+
 @app.get("/api/projects")
 def projects(source: str = "remote"):
     source = project_source(source)
+    rels = load_projects(source)
     items = []
-    for rel in load_projects(source):
-        if source == "local":
+    if source == "local":
+        for rel in rels:
             exists = local_project_root(rel, must_exist=False).is_dir()
+            doc, found = read_refs_doc(rel, source)
+            items.append({"project": rel, "source": source, "exists": exists,
+                          "has_refs": found, "count": len(doc["references"])})
+        return {"source": source, "items": items}
+    states = remote_project_states(rels) if rels else {}
+    for rel in rels:
+        state = states.get(rel)
+        if state is None:
+            raise HTTPException(502, f"读取远端项目失败: {rel}")
+        if state["has_refs"]:
+            try:
+                doc = json.loads(state["text"])
+            except ValueError:
+                raise HTTPException(500, f"文件不是合法 JSON，未改写原文件: {refs_file(rel, source)}")
+            refs, found = parse_refs_document(doc, "found", rel, source)
         else:
-            exists = remote_exists(f"{WORKSHOP}/{rel}", "d")
-        doc, found = read_refs_doc(rel, source)
-        items.append({"project": rel, "source": source, "exists": exists,
-                      "has_refs": found, "count": len(doc["references"])})
+            refs, found = parse_refs_document(None, "missing", rel, source)
+        items.append({"project": rel, "source": source, "exists": state["exists"],
+                      "has_refs": found, "count": len(refs["references"])})
     return {"source": source, "items": items}
 
 
@@ -4173,6 +4705,52 @@ def project_file(project: str, path: str, source: str = "remote"):
         background=BackgroundTask(tmp.unlink, missing_ok=True),
         headers=headers,
     )
+
+
+@app.get("/api/project/markdown")
+def project_markdown(project: str, path: str, source: str = "remote"):
+    source = project_source(source)
+    rel, root = registered_project_root(project, source)
+    rel_path = relative_file(path)
+    if PROJECT_EXT_VIEW.get(project_ext(rel_path)) != "md":
+        raise HTTPException(400, "该文件不是 Markdown")
+    result = {"project": rel, "path": rel_path, "source": source}
+    if source == "local":
+        target = local_project_file(root, rel_path)
+        size = target.stat().st_size
+        if size > PROJECT_MARKDOWN_MAX_BYTES:
+            raise HTTPException(413, "Markdown 文件超过预览大小限制")
+        try:
+            raw = target.read_bytes()
+        except OSError:
+            raise HTTPException(502, "Markdown 文件读取失败")
+    else:
+        target = f"{root}/{rel_path}"
+        script = remote_guard(target) + (
+            f"if [ ! -f {q(target)} ]; then exit 44; fi; "
+            f"size=$(stat -c %s -- {q(target)}) || exit 1; "
+            f"if [ \"$size\" -gt {PROJECT_MARKDOWN_MAX_BYTES} ]; then exit 45; fi; "
+            f"cat -- {q(target)}"
+        )
+        remote = ssh_run(script, timeout=30, binary=True)
+        if remote.returncode == 44:
+            raise HTTPException(404, "Markdown 文件不存在")
+        if remote.returncode == 45:
+            raise HTTPException(413, "Markdown 文件超过预览大小限制")
+        if remote.returncode == 73:
+            raise HTTPException(400, "项目路径包含符号链接，拒绝访问")
+        if remote.returncode != 0:
+            raise HTTPException(502, "Markdown 文件读取失败")
+        raw = remote.stdout if isinstance(remote.stdout, bytes) else remote.stdout.encode("utf-8")
+        if len(raw) > PROJECT_MARKDOWN_MAX_BYTES:
+            raise HTTPException(413, "Markdown 文件超过预览大小限制")
+        size = len(raw)
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("utf-8", "replace").lstrip("\ufeff")
+    result.update({"text": text, "size": size})
+    return result
 
 
 @app.get("/api/refs")
@@ -4350,25 +4928,23 @@ def put_refs(payload: dict):
     return {"ok": True, "count": len(clean), "revision": doc.revision, "source": source}
 
 
-@app.post("/api/refs/add")
-@tracked_operation
-@serialized_write
-def add_ref(payload: dict, operation_id: Optional[str] = None):
-    source = project_source(payload.get("source"))
-    rel = local_abs_path(payload.get("project", "")) if source == "local" \
-        else project_rel(payload.get("project", ""))
-    key = str(payload.get("path", "")).strip().strip("/")
-    is_knowledge_key = KNOWLEDGE_KEY.fullmatch(key) is not None
-    if not is_knowledge_key:
+def ref_key(value) -> str:
+    key = str(value or "").strip().strip("/")
+    if KNOWLEDGE_KEY.fullmatch(key) is None:
         parts = key.split("/")
         if len(parts) != 3:
             raise HTTPException(400, "path 必须是 主题/年份/slug 或 _knowledge/<id>")
         for part in parts:
             seg(part)
-    note = str(payload.get("note", "") or "").strip()
-    update = bool(payload.get("update"))
+    return key
 
-    if is_knowledge_key:
+
+def build_ref(source: str, key: str, found: Optional[dict] = None):
+    """Return (reference entry, label) for a library key.
+
+    `found` lets callers reuse one paper scan for a whole batch.
+    """
+    if KNOWLEDGE_KEY.fullmatch(key) is not None:
         item_id = key.split("/", 1)[1]
         info = read_knowledge_local(item_id) if source == "local" else read_knowledge_remote(item_id)
         if info is None:
@@ -4380,38 +4956,40 @@ def add_ref(payload: dict, operation_id: Optional[str] = None):
             ref["url"] = info["url"]
         if info["title"]:
             ref["title"] = info["title"]
-        label = "资料"
-    else:
-        found = scan_local() if source == "local" else scan_remote()
-        info = found.get(key)
-        if source == "local":
-            if not info or not info.get("has_pdf"):
-                raise HTTPException(404, f"本机资料库中没有这篇论文的 pdf: {key}")
-            ref = {"path": key}
-            if info.get("pdf"):
-                ref["pdf"] = info["pdf"]
-            if info.get("title"):
-                ref["title"] = info["title"]
-        else:
-            if not info or not (info.get("has_pdf") or info.get("has_source")):
-                raise HTTPException(404, f"库中没有这篇论文: {key}")
-            ref = {"path": key}
-            if info.get("entry"):
-                ref["entry"] = info["entry"]
-            if info.get("pdf"):
-                ref["pdf"] = info["pdf"]
-            if info.get("title"):
-                ref["title"] = info["title"]
-            code = str(info.get("code") or "").strip()
-            if code and len(code) <= 500 and CODE_LINK.fullmatch(code):
-                ref["code"] = code
-            openreview = str(info.get("openreview") or "").strip()
-            if openreview:
-                ref["openreview"] = openreview
-        label = "论文"
+        return ref, "资料"
 
-    doc, _ = read_refs_doc(rel, source)
-    created_dir = False
+    if found is None:
+        found = scan_local() if source == "local" else scan_remote()
+    info = found.get(key)
+    if source == "local":
+        if not info or not info.get("has_pdf"):
+            raise HTTPException(404, f"本机资料库中没有这篇论文的 pdf: {key}")
+        ref = {"path": key}
+        if info.get("pdf"):
+            ref["pdf"] = info["pdf"]
+        if info.get("title"):
+            ref["title"] = info["title"]
+    else:
+        if not info or not (info.get("has_pdf") or info.get("has_source")):
+            raise HTTPException(404, f"库中没有这篇论文: {key}")
+        ref = {"path": key}
+        if info.get("entry"):
+            ref["entry"] = info["entry"]
+        if info.get("pdf"):
+            ref["pdf"] = info["pdf"]
+        if info.get("title"):
+            ref["title"] = info["title"]
+        code = str(info.get("code") or "").strip()
+        if code and len(code) <= 500 and CODE_LINK.fullmatch(code):
+            ref["code"] = code
+        openreview = str(info.get("openreview") or "").strip()
+        if openreview:
+            ref["openreview"] = openreview
+    return ref, "论文"
+
+
+def refs_project_ready(rel: str, source: str, create_missing: bool) -> bool:
+    """Ensure the project folder exists; returns True when it was just created."""
     if source == "local":
         if not local_project_root(rel, must_exist=False).is_dir():
             raise HTTPException(409, detail={
@@ -4419,15 +4997,33 @@ def add_ref(payload: dict, operation_id: Optional[str] = None):
                 "missing_dir": True,
                 "project": rel,
             })
-    elif not remote_exists(f"{WORKSHOP}/{rel}", "d"):
-        if not bool(payload.get("create_missing")):
+        return False
+    if not remote_exists(f"{WORKSHOP}/{rel}", "d"):
+        if not create_missing:
             raise HTTPException(409, detail={
                 "message": f"远端上还没有项目目录: {rel}",
                 "missing_dir": True,
                 "project": rel,
             })
         ensure_project_dir(rel)
-        created_dir = True
+        return True
+    return False
+
+
+@app.post("/api/refs/add")
+@tracked_operation
+@serialized_write
+def add_ref(payload: dict, operation_id: Optional[str] = None):
+    source = project_source(payload.get("source"))
+    rel = local_abs_path(payload.get("project", "")) if source == "local" \
+        else project_rel(payload.get("project", ""))
+    key = ref_key(payload.get("path", ""))
+    note = str(payload.get("note", "") or "").strip()
+    update = bool(payload.get("update"))
+    ref, label = build_ref(source, key)
+
+    doc, _ = read_refs_doc(rel, source)
+    created_dir = refs_project_ready(rel, source, bool(payload.get("create_missing")))
     existing = next((r for r in doc["references"]
                      if isinstance(r, dict) and r.get("path") == key), None)
     if existing is not None and not update:
@@ -4449,6 +5045,65 @@ def add_ref(payload: dict, operation_id: Optional[str] = None):
     write_refs_doc(rel, doc, source)
     return {"ok": True, "action": action, "ref": ref, "count": len(doc["references"]),
             "created_dir": created_dir, "source": source}
+
+
+REFS_BATCH_LIMIT = 200
+
+
+@app.post("/api/refs/add-batch")
+@tracked_operation
+@serialized_write
+def add_refs_batch(payload: dict, operation_id: Optional[str] = None):
+    source = project_source(payload.get("source"))
+    rel = local_abs_path(payload.get("project", "")) if source == "local" \
+        else project_rel(payload.get("project", ""))
+    raw = payload.get("paths")
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(400, "paths 必须是非空数组")
+    keys: list[str] = []
+    for item in raw:
+        key = ref_key(item)
+        if key not in keys:
+            keys.append(key)
+    if len(keys) > REFS_BATCH_LIMIT:
+        raise HTTPException(400, f"一次最多加入 {REFS_BATCH_LIMIT} 项，请分批操作")
+    update = bool(payload.get("update"))
+
+    doc, _ = read_refs_doc(rel, source)
+    created_dir = refs_project_ready(rel, source, bool(payload.get("create_missing")))
+    found = None
+    if any(KNOWLEDGE_KEY.fullmatch(key) is None for key in keys):
+        found = scan_local() if source == "local" else scan_remote()
+    references = list(doc["references"])
+    index = {ref.get("path"): i for i, ref in enumerate(references)
+             if isinstance(ref, dict) and ref.get("path")}
+    added: list[str] = []
+    updated: list[str] = []
+    skipped: list[str] = []
+    failed: list[dict] = []
+    for key in keys:
+        try:
+            ref, _label = build_ref(source, key, found)
+        except HTTPException as exc:
+            message = exc.detail.get("message") if isinstance(exc.detail, dict) else exc.detail
+            failed.append({"path": key, "message": str(message or "无法加入")})
+            continue
+        slot = index.get(key)
+        if slot is None:
+            index[key] = len(references)
+            references.append(ref)
+            added.append(key)
+        elif update:
+            references[slot] = ref
+            updated.append(key)
+        else:
+            skipped.append(key)
+    if added or updated:
+        doc["references"] = references
+        write_refs_doc(rel, doc, source)
+    return {"ok": True, "added": added, "updated": updated, "skipped": skipped,
+            "failed": failed, "count": len(references), "created_dir": created_dir,
+            "source": source}
 
 
 @app.post("/api/refs/sync")
@@ -4556,6 +5211,504 @@ def sync_refs(payload: dict, operation_id: Optional[str] = None):
         write_refs_doc(rel, doc, source)
     return {"ok": True, "updated": updated, "missing": missing,
             "count": len(doc["references"]), "source": source}
+
+
+# ------------------------------------------------------------ review space
+# 审稿任务只落在本机审稿目录内；稿件不进论文库扫描、引用清单、查重或回收区。
+
+REVIEW_TRASH = ".trash"
+REVIEW_MANUSCRIPT = "manuscript.pdf"
+REVIEW_BODY_NAME = "review.md"
+REVIEW_TASK_NAME = "task.json"
+REVIEW_MAX_BODY = 400_000
+REVIEW_MAX_FILES = 50
+REVIEW_TEMPLATE_FILE = BASE / "config" / "review-templates.json"
+REVIEW_PURGE_CONFIRM = "清除稿件"
+REVIEW_DELETE_CONFIRM = "删除"
+
+
+def review_root(create: bool = False) -> Path:
+    if REVIEW_LOCAL.is_symlink():
+        raise HTTPException(400, "审稿目录不能是符号链接")
+    if create and not REVIEW_LOCAL.is_dir():
+        try:
+            REVIEW_LOCAL.mkdir(parents=True, mode=0o700)
+            os.chmod(REVIEW_LOCAL, 0o700)
+        except OSError as exc:
+            raise HTTPException(500, f"无法创建审稿目录：{exc}")
+    return REVIEW_LOCAL
+
+
+def review_path(*parts: str) -> Path:
+    root = review_root().resolve()
+    path = root
+    for part in parts:
+        for component in relative_file(part).split("/"):
+            path = path / component
+            if path.is_symlink():
+                raise HTTPException(400, "审稿目录内不允许符号链接")
+    if not path.resolve().is_relative_to(root):
+        raise HTTPException(400, "路径超出审稿目录")
+    return path
+
+
+def review_key_parts(key: str):
+    try:
+        return rv.parse_key(key)
+    except rv.ReviewError as exc:
+        raise HTTPException(400, exc.message)
+
+
+def review_task_dir(key: str) -> Path:
+    venue, submission = review_key_parts(key)
+    return review_path(venue, submission)
+
+
+def review_templates() -> dict:
+    path = REVIEW_TEMPLATE_FILE
+    if path.is_symlink():
+        raise HTTPException(400, "审稿模板配置不能是符号链接")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raw = {}
+    except (OSError, ValueError) as exc:
+        raise HTTPException(500, f"审稿模板配置无法读取，未改写任何文件: {exc}")
+    if not isinstance(raw, dict):
+        raise HTTPException(500, "审稿模板配置必须是 JSON 对象")
+    try:
+        return rv.templates_from(raw)
+    except rv.ReviewError as exc:
+        raise HTTPException(400, exc.message)
+
+
+def review_dirs(root: Path) -> list:
+    """合法名称的真实子目录；隐藏项、符号链接与非法名一律跳过。"""
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        if name.startswith(".") or not SEG.fullmatch(name):
+            continue
+        child = root / name
+        if child.is_dir() and not child.is_symlink():
+            found.append(name)
+    return found
+
+
+def review_supplement_files(task_dir: Path) -> list:
+    base = task_dir / "supplement"
+    if not base.is_dir() or base.is_symlink():
+        return []
+    found = []
+    for dirpath, dirnames, filenames in os.walk(base):
+        here = Path(dirpath)
+        dirnames[:] = [d for d in sorted(dirnames)
+                       if SEG.fullmatch(d) and not (here / d).is_symlink()]
+        for name in sorted(filenames):
+            item = here / name
+            if item.is_symlink() or not item.is_file() or item.suffix.lower() != ".pdf":
+                continue
+            if not SEG.fullmatch(name):
+                continue
+            rel = item.relative_to(base).as_posix()
+            if len(rel.split("/")) > 2:
+                continue
+            found.append({"name": "supplement/" + rel, "size": item.stat().st_size})
+            if len(found) >= REVIEW_MAX_FILES:
+                return found
+    return found
+
+
+def review_task_files(task_dir: Path) -> list:
+    files = []
+    main = task_dir / REVIEW_MANUSCRIPT
+    if main.is_file() and not main.is_symlink():
+        files.append({"name": REVIEW_MANUSCRIPT, "size": main.stat().st_size})
+    return files + review_supplement_files(task_dir)
+
+
+def read_local_json_soft(path: Path):
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def read_review_body(task_dir: Path):
+    path = task_dir / REVIEW_BODY_NAME
+    if path.is_symlink():
+        raise HTTPException(400, "审稿笔记不能是符号链接")
+    if not path.is_file():
+        return "", "missing"
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        raise HTTPException(500, f"无法读取审稿笔记，未改写原文件: {path}")
+    if len(raw) > REVIEW_MAX_BODY:
+        raise HTTPException(413, "审稿笔记超过大小上限，请先在本地编辑器拆分")
+    try:
+        return raw.decode("utf-8"), hashlib.sha256(raw).hexdigest()
+    except UnicodeDecodeError:
+        raise HTTPException(500, f"审稿笔记不是 UTF-8 文本，未改写原文件: {path}")
+
+
+def write_review_text(path: Path, text: str, expected: Optional[str] = None) -> str:
+    if path.is_symlink():
+        raise HTTPException(400, "审稿笔记不能是符号链接")
+    if expected == "missing":
+        if os.path.lexists(path):
+            raise HTTPException(409, "审稿笔记已存在，请刷新后重试")
+    elif expected is not None:
+        try:
+            current = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            raise HTTPException(409, "审稿笔记已被其他操作修改，请刷新后重试")
+        if current != expected:
+            raise HTTPException(409, "审稿笔记已被其他操作修改，请刷新后重试")
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix="." + path.name + ".", delete=False) as fp:
+            tmp = Path(fp.name)
+            fp.write(text)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        raise HTTPException(500, f"审稿笔记写入失败，原文件未改动: {path}")
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def write_review_bytes(path: Path, data: bytes) -> None:
+    if path.is_symlink():
+        raise HTTPException(400, "稿件文件不能是符号链接")
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix="." + path.name + ".",
+                                         delete=False) as fp:
+            tmp = Path(fp.name)
+            fp.write(data)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        raise HTTPException(500, f"稿件写入失败，原文件未改动: {path}")
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+
+def save_review_task(task_dir: Path, task: dict, created_at: str) -> dict:
+    stored = {key: value for key, value in task.items() if key != "key"}
+    stored["created_at"] = created_at
+    stored["updated_at"] = rv.now_text()
+    write_local_json(task_dir / REVIEW_TASK_NAME, stored)
+    return {"key": task["key"], **stored}
+
+
+def scan_review() -> list:
+    root = review_root()
+    if not root.is_dir():
+        return []
+    today = datetime.now(timezone.utc).date()
+    items = []
+    for venue in review_dirs(root):
+        for submission in review_dirs(root / venue):
+            task_dir = root / venue / submission
+            raw = read_local_json_soft(task_dir / REVIEW_TASK_NAME)
+            task = rv.parse_task(raw, venue, submission)
+            days, overdue = rv.deadline_of(task["due"], today)
+            body = task_dir / REVIEW_BODY_NAME
+            files = review_task_files(task_dir)
+            items.append({
+                **task,
+                "status_label": rv.STATUS_LABELS[task["status"]],
+                "days_left": days,
+                "overdue": overdue,
+                "files": files,
+                "has_manuscript": any(f["name"] == REVIEW_MANUSCRIPT for f in files),
+                "has_draft": body.is_file() and bool(body.stat().st_size),
+                "meta_ok": raw is not None,
+            })
+    items.sort(key=lambda x: (x["due"] or "9999-12-31", x["venue"].lower(),
+                              x["submission"].lower()))
+    return items
+
+
+@app.get("/api/review")
+def review_list():
+    items = scan_review()
+    templates = review_templates()
+    trash = review_root() / REVIEW_TRASH
+    return {
+        "count": len(items),
+        "items": items,
+        "root": str(REVIEW_LOCAL),
+        "trash_count": len(review_dirs(trash)) if trash.is_dir() else 0,
+        "templates": [{"name": name, **body} for name, body in sorted(templates.items())],
+        "statuses": [{"value": value, "label": rv.STATUS_LABELS[value]} for value in rv.STATUSES],
+    }
+
+
+@app.post("/api/review")
+@serialized_write
+def create_review_task(payload: dict):
+    try:
+        task = rv.new_task(payload)
+    except rv.ReviewError as exc:
+        raise HTTPException(400, exc.message)
+    name = str(payload.get("template") or rv.DEFAULT_TEMPLATE_NAME)
+    templates = review_templates()
+    if name not in templates:
+        raise HTTPException(400, f"没有这个审稿模板: {name}")
+    task_dir = review_path(task["venue"], task["submission"])
+    if os.path.lexists(task_dir):
+        raise HTTPException(409, f"已存在审稿任务：{task['key']}")
+    update_progress("创建本机审稿任务目录")
+    review_root(create=True)
+    venue_dir = review_path(task["venue"])
+    try:
+        if not venue_dir.is_dir():
+            venue_dir.mkdir(mode=0o700)
+        task_dir.mkdir(mode=0o700)
+    except FileExistsError:
+        raise HTTPException(409, f"已存在审稿任务：{task['key']}")
+    except OSError as exc:
+        raise HTTPException(500, f"无法创建任务目录：{exc}")
+    os.chmod(task_dir, 0o700)
+    saved = save_review_task(task_dir, task, rv.now_text())
+    write_review_text(task_dir / REVIEW_BODY_NAME, rv.skeleton(templates[name]), "missing")
+    return {"ok": True, "task": saved, "notice": f"已创建 {task['key']}（只存在本机）"}
+
+
+@app.get("/api/review/task")
+def review_task_detail(key: str):
+    venue, submission = review_key_parts(key)
+    task_dir = review_path(venue, submission)
+    if not task_dir.is_dir():
+        raise HTTPException(404, f"审稿任务不存在: {key}")
+    task = rv.parse_task(read_local_json_soft(task_dir / REVIEW_TASK_NAME), venue, submission)
+    days, overdue = rv.deadline_of(task["due"])
+    body, revision = read_review_body(task_dir)
+    return {
+        "task": {**task, "status_label": rv.STATUS_LABELS[task["status"]],
+                 "days_left": days, "overdue": overdue},
+        "review": body,
+        "revision": revision,
+        "files": review_task_files(task_dir),
+    }
+
+
+@app.post("/api/review/task")
+@serialized_write
+def save_review_task_endpoint(payload: dict):
+    key = str(payload.get("key") or "")
+    venue, submission = review_key_parts(key)
+    task_dir = review_path(venue, submission)
+    if not task_dir.is_dir():
+        raise HTTPException(404, f"审稿任务不存在: {key}")
+    existing = read_local_json_soft(task_dir / REVIEW_TASK_NAME) or {}
+    fields = payload.get("fields")
+    fields = fields if isinstance(fields, dict) else {}
+    if fields:
+        try:
+            task = rv.new_task({**fields, "venue": venue, "submission": submission},
+                               existing=existing)
+        except rv.ReviewError as exc:
+            raise HTTPException(400, exc.message)
+    else:
+        task = rv.parse_task(existing, venue, submission)
+    revision = None
+    if "review" in payload:
+        body = payload.get("review")
+        if not isinstance(body, str):
+            raise HTTPException(400, "审稿正文必须是文本")
+        if len(body.encode("utf-8")) > REVIEW_MAX_BODY:
+            raise HTTPException(413, "审稿正文超过大小上限")
+        if any(ord(ch) < 32 and ch not in "\n\t" or ord(ch) == 127 for ch in body):
+            raise HTTPException(400, "审稿正文不能包含控制字符")
+        expected = payload.get("expected")
+        revision = write_review_text(
+            task_dir / REVIEW_BODY_NAME, body,
+            expected if isinstance(expected, str) else None)
+    if revision is None:
+        _, revision = read_review_body(task_dir)
+    created = existing.get("created_at")
+    saved = save_review_task(task_dir, task, created if isinstance(created, str) and created
+                             else rv.now_text())
+    return {"ok": True, "task": saved, "revision": revision,
+            "notice": "已保存到本机审稿目录"}
+
+
+@app.post("/api/review/manuscript")
+@serialized_write
+def upload_review_manuscript(
+    key: str = Form(...),
+    overwrite: bool = Form(False),
+    pdf: UploadFile = File(...),
+):
+    venue, submission = review_key_parts(key)
+    task_dir = review_path(venue, submission)
+    if not task_dir.is_dir():
+        raise HTTPException(404, f"审稿任务不存在: {key}")
+    if Path(str(pdf.filename or "")).suffix.lower() != ".pdf":
+        raise HTTPException(400, "稿件必须是 pdf 文件")
+    update_progress("读取上传的稿件")
+    data = read_limited(pdf.file)
+    if not data.startswith(b"%PDF-"):
+        raise HTTPException(400, "文件不是有效的 pdf")
+    target = task_dir / REVIEW_MANUSCRIPT
+    if target.is_symlink():
+        raise HTTPException(400, "稿件文件不能是符号链接")
+    if target.exists() and not bool(overwrite):
+        raise HTTPException(409, "该任务已有稿件，确认覆盖后重试")
+    write_review_bytes(target, data)
+    return {"ok": True, "file": {"name": REVIEW_MANUSCRIPT, "size": len(data)},
+            "notice": "稿件只保存在本机审稿目录"}
+
+
+@app.post("/api/review/purge")
+@serialized_write
+def purge_review_manuscript(payload: dict):
+    key = str(payload.get("key") or "")
+    if str(payload.get("confirm") or "").strip() != REVIEW_PURGE_CONFIRM:
+        raise HTTPException(400, f"确认文字必须是「{REVIEW_PURGE_CONFIRM}」")
+    venue, submission = review_key_parts(key)
+    task_dir = review_path(venue, submission)
+    if not task_dir.is_dir():
+        raise HTTPException(404, f"审稿任务不存在: {key}")
+    main = task_dir / REVIEW_MANUSCRIPT
+    supplement = task_dir / "supplement"
+    if main.is_symlink():
+        raise HTTPException(400, "稿件是符号链接，未删除")
+    if supplement.is_symlink():
+        raise HTTPException(400, "补充材料目录是符号链接，未删除")
+    if supplement.is_dir():
+        for dirpath, dirnames, filenames in os.walk(supplement):
+            for name in list(dirnames) + list(filenames):
+                if (Path(dirpath) / name).is_symlink():
+                    raise HTTPException(400, "补充材料内含符号链接，未删除任何文件")
+    removed = []
+    if main.is_file():
+        try:
+            main.unlink()
+        except OSError:
+            raise HTTPException(500, "稿件删除失败，未继续")
+        removed.append(REVIEW_MANUSCRIPT)
+    if supplement.is_dir():
+        try:
+            shutil.rmtree(supplement)
+        except OSError:
+            raise HTTPException(500, f"补充材料删除失败，稿件已清除: {removed}")
+        removed.append("supplement/")
+    existing = read_local_json_soft(task_dir / REVIEW_TASK_NAME) or {}
+    task = rv.parse_task(existing, venue, submission)
+    task["purged_at"] = rv.now_text()
+    stored = save_review_task(task_dir, task, existing.get("created_at") or rv.now_text())
+    return {"ok": True, "removed": removed, "task": stored,
+            "notice": "稿件已清除，评审文本保留" if removed else "没有需要清除的稿件"}
+
+
+@app.delete("/api/review", dependencies=[Depends(consume_write_body)])
+@serialized_write
+def delete_review_task(key: str, confirm: str):
+    if confirm != REVIEW_DELETE_CONFIRM:
+        raise HTTPException(400, f"确认文字必须是「{REVIEW_DELETE_CONFIRM}」")
+    task_dir = review_task_dir(key)
+    if not task_dir.is_dir():
+        raise HTTPException(404, f"审稿任务不存在: {key}")
+    for dirpath, dirnames, filenames in os.walk(task_dir):
+        for name in list(dirnames) + list(filenames):
+            if (Path(dirpath) / name).is_symlink():
+                raise HTTPException(400, "任务目录内含符号链接，未移动")
+    update_progress("把任务移入审稿回收区")
+    trash = review_path(REVIEW_TRASH)
+    trash.mkdir(parents=True, mode=0o700, exist_ok=True)
+    entry = trash / uuid4().hex
+    os.replace(task_dir, entry)
+    return {"ok": True, "trash_id": entry.name, "key": key,
+            "notice": "任务已移入回收区，可随时恢复"}
+
+
+@app.get("/api/review/trash")
+def review_trash_list():
+    trash = review_root() / REVIEW_TRASH
+    items = []
+    for entry in review_dirs(trash):
+        folder = trash / entry
+        raw = read_local_json_soft(folder / REVIEW_TASK_NAME)
+        task = rv.parse_task(raw, str((raw or {}).get("venue") or "?"),
+                             str((raw or {}).get("submission") or "?"))
+        body = folder / REVIEW_BODY_NAME
+        files = review_task_files(folder)
+        items.append({**task, "trash_id": entry, "files": files,
+                      "has_draft": body.is_file() and bool(body.stat().st_size)})
+    items.sort(key=lambda x: x["trash_id"], reverse=True)
+    return {"count": len(items), "items": items}
+
+
+@app.post("/api/review/trash/restore")
+@serialized_write
+def restore_review_task(payload: dict):
+    trash_id = str(payload.get("trash_id") or "")
+    if not RECOVERY_ID.fullmatch(trash_id):
+        raise HTTPException(400, "回收区编号不合法")
+    folder = review_path(REVIEW_TRASH, trash_id)
+    if not folder.is_dir():
+        raise HTTPException(404, "回收区里没有这个任务")
+    raw = read_local_json_soft(folder / REVIEW_TASK_NAME)
+    venue = str((raw or {}).get("venue") or "")
+    submission = str((raw or {}).get("submission") or "")
+    try:
+        target = review_path(rv.key_of(venue, submission))
+    except rv.ReviewError as exc:
+        raise HTTPException(409, f"任务元数据损坏，无法确定原始位置：{exc.message}")
+    if os.path.lexists(target):
+        raise HTTPException(409, f"同名任务已存在：{venue}/{submission}")
+    os.replace(folder, target)
+    return {"ok": True, "key": f"{venue}/{submission}", "notice": "任务已恢复"}
+
+
+@app.delete("/api/review/trash", dependencies=[Depends(consume_write_body)])
+@serialized_write
+def purge_review_trash(trash_id: str, confirm: str):
+    if confirm != RECOVERY_CONFIRM:
+        raise HTTPException(400, f"确认文字必须是「{RECOVERY_CONFIRM}」")
+    if not RECOVERY_ID.fullmatch(trash_id):
+        raise HTTPException(400, "回收区编号不合法")
+    folder = review_path(REVIEW_TRASH, trash_id)
+    if not folder.is_dir():
+        raise HTTPException(404, "回收区里没有这个任务")
+    for dirpath, dirnames, filenames in os.walk(folder):
+        for name in list(dirnames) + list(filenames):
+            if (Path(dirpath) / name).is_symlink():
+                raise HTTPException(400, "任务内含符号链接，未删除")
+    shutil.rmtree(folder)
+    return {"ok": True, "notice": "已彻底删除，稿件与评审文本不可恢复"}
+
+
+@app.get("/api/review/pdf")
+def review_pdf(key: str, name: str = REVIEW_MANUSCRIPT):
+    venue, submission = review_key_parts(key)
+    path = review_path(venue, submission, name)
+    if Path(relative_file(name)).suffix.lower() != ".pdf":
+        raise HTTPException(400, "只能预览 pdf 稿件")
+    if not path.is_file():
+        raise HTTPException(404, "稿件文件不存在")
+    if path.stat().st_size > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "PDF 超过预览大小限制")
+    return FileResponse(path, media_type="application/pdf")
 
 
 app.mount("/", StaticFiles(directory=str(BASE / "app" / "static"), html=True), name="static")

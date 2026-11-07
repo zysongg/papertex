@@ -12,6 +12,7 @@ logs/
 config/*.json
 !config/config.example.json
 !config/projects.example.json
+!config/review-templates.example.json
 config/*.lock
 
 # Personal one-off migration scripts kept outside the public repository

@@ -80,7 +80,7 @@ class LocalRequestGuard:
             return False
         if scope.get("method", "GET").upper() not in ("GET", "HEAD"):
             return False
-        if scope.get("path") not in ("/api/pdf", "/api/project/file"):
+        if scope.get("path") not in ("/api/pdf", "/api/project/file", "/api/review/pdf"):
             return False
         raw = scope.get("query_string", b"")
         if not isinstance(raw, (bytes, bytearray)) or len(raw) > 4096:

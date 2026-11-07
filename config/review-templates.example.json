@@ -1,0 +1,13 @@
+{
+  "期刊投稿": {
+    "fields": ["rating", "confidence"],
+    "sections": [
+      "Fit with the journal scope",
+      "Originality and technical soundness",
+      "Experimental validation",
+      "Presentation and reproducibility",
+      "Required revisions",
+      "Recommendation"
+    ]
+  }
+}

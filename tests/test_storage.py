@@ -40,6 +40,7 @@ class StorageTests(unittest.TestCase):
         self.root = Path(self.temp.name).resolve()
         self.addCleanup(self.temp.cleanup)
         s = self.server
+        s._ARXIV_API_BLOCKED_UNTIL = 0.0
         (self.root / 'config').mkdir()
         self.local = self.root / 'local'
         self.remote = self.root / 'remote'
@@ -306,11 +307,69 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(citation['fields']['doi'], '')
         self.assertTrue(any('doi' in w for w in citation['warnings']))
 
+    def test_paper_tags_round_trip_normalize_and_clear(self):
+        self.local_copy()
+        s = self.server
+        saved = self.research_write(s.set_paper_tags, key=self.key,
+                                    tags=[' Mamba ', 'MoE', '', 'mamba', 'Mamba'])
+        self.assertEqual(saved['tags'], ['Mamba', 'MoE', 'mamba'])
+        self.assertEqual(s.get_research()['items'][self.key]['tags'], ['Mamba', 'MoE', 'mamba'])
+        self.assertEqual(json.loads(
+            (self.root / 'config/research.json').read_text())['papers'][self.key]['tags'],
+            ['Mamba', 'MoE', 'mamba'])
+        # 逗号分隔的文本与数组走同一套归一化
+        saved = self.research_write(s.set_paper_tags, key=self.key, tags='时序， 多变量预测')
+        self.assertEqual(saved['tags'], ['时序', '多变量预测'])
+        saved = self.research_write(s.set_paper_tags, key=self.key, tags=[])
+        self.assertEqual(saved['tags'], [])
+        self.assertNotIn('tags', s.get_research()['items'][self.key])
+
+    def test_paper_tags_reject_illegal_input_without_touching_records(self):
+        self.local_copy()
+        s = self.server
+        for tags in (['x' * 41], ['x' * 41, 'b'], list(map(str, range(21))),
+                     ['带\n换行'], {'a': 1}, ['标签', 7]):
+            self.assert_status(400, lambda tags=tags: self.research_write(
+                s.set_paper_tags, key=self.key, tags=tags))
+        self.assertEqual(s.get_research()['items'], {})
+        self.assert_status(404, lambda: self.research_write(
+            s.set_paper_tags, key='TS/2026/absent', tags=['x']))
+        stale = s.get_research()['revision']
+        self.research_write(s.set_reading, key=self.key, status='read', note='')
+        self.assert_status(409, lambda: s.set_paper_tags(
+            dict(key=self.key, tags=['x'], revision=stale)))
+
+    def test_paper_tags_over_limit_is_rejected_after_dedupe(self):
+        self.local_copy()
+        s = self.server
+        self.assert_status(400, lambda: self.research_write(
+            s.set_paper_tags, key=self.key, tags=['t' + str(i) for i in range(21)]))
+        saved = self.research_write(
+            s.set_paper_tags, key=self.key,
+            tags=['t' + str(i) for i in range(20)] + ['t0'])
+        self.assertEqual(len(saved['tags']), 20)
+
+    def test_corrupt_paper_tags_make_research_read_only(self):
+        self.local_copy()
+        s = self.server
+        path = self.root / 'config/research.json'
+        for papers in ({self.key: {'tags': 123}},
+                      {self.key: {'tags': [None]}},
+                      {self.key: {'tags': ['x' * 41]}},
+                      {self.key: {'tags': ['非法\x00字符']}}):
+            path.write_text(json.dumps({'papers': papers}))
+            raw = path.read_text()
+            self.assert_status(500, s.get_research)
+            self.assert_status(500, lambda: s.set_paper_tags(
+                dict(key=self.key, tags=['ok'], revision='0' * 64)))
+            self.assertEqual(path.read_text(), raw, '损坏的标签记录绝不能被覆盖')
+
     def test_research_rename_preserves_fields_and_updates_cite_key(self):
         meta = self.seed()
         s = self.server
         self.assertEqual(s.get_citation(self.key)['cite_key'], self.slug)
         self.research_write(s.set_reading, key=self.key, status='read', note='keep note')
+        self.research_write(s.set_paper_tags, key=self.key, tags=['MoE', '时序'])
         self.research_write(s.set_citation, key=self.key, fields={'title': 'Override'})
         other = 'TS/2026/other'
         (self.local / other).mkdir(parents=True)
@@ -322,6 +381,7 @@ class StorageTests(unittest.TestCase):
         record = s.get_research()['items'][result['key']]
         self.assertNotIn(self.key, s.get_research()['items'])
         self.assertEqual(record['note'], 'keep note')
+        self.assertEqual(record['tags'], ['MoE', '时序'])
         self.assertEqual(record['bibliography']['title'], 'Override')
         self.assertEqual(s.get_citation(result['key'])['cite_key'], '2026-ICML-Li-New')
         self.assertNotIn('cite_key', record)
@@ -525,7 +585,8 @@ class StorageTests(unittest.TestCase):
         s = self.server
         meta = dict(title='Batch', authors=['Full Name'], year=2025, doi='10.1234/test',
                     added_at='2026-01-02T03:04:05+00:00')
-        listing = f'{self.key}\td\n{self.key}/meta.json\tf\nTS/2026/not-a-directory\tf\n'
+        listing = (f'{self.key}\td\t4096\n{self.key}/meta.json\tf\t120\n'
+                   f'{self.key}/note.md\tf\t42\nTS/2026/not-a-directory\tf\t1\n')
         output = f'__META__{self.key}/meta.json\n{json.dumps(meta)}\n__END__\n'
         with patch.object(s, 'ssh_need', side_effect=[
                 subprocess.CompletedProcess([], 0, listing, ''),
@@ -533,10 +594,109 @@ class StorageTests(unittest.TestCase):
                 patch.object(s, 'save_title_cache', side_effect=AssertionError('GET cache write')):
             papers = self.actual_scan_remote(cache_titles=False)
         self.assertEqual(runner.call_count, 2)
+        self.assertTrue(papers[self.key]['has_note'])
+        self.assertTrue(papers[self.key]['has_meta'])
         self.assertEqual(papers[self.key]['_citation_meta'], meta)
         self.assertEqual(papers[self.key]['added_at'], '2026-01-02T03:04:05+00:00')
         self.assertNotIn('TS/2026/not-a-directory', papers)
         self.assertFalse(s.titles_file().exists())
+
+    def test_paper_note_roundtrip_conflict_and_delete(self):
+        self.seed()
+        s = self.server
+        local_note = self.local / self.key / 'note.md'
+        local_note.parent.mkdir(parents=True)
+        blank = s.get_paper_note(self.topic, self.year, self.slug)
+        self.assertEqual(blank['revision'], 'missing')
+        self.assertFalse(blank['has_note'])
+        text = '# 结论\n\n- 关键公式 $x^2$\n'
+        saved = s.save_paper_note({'topic': self.topic, 'year': self.year, 'slug': self.slug,
+                                   'text': text, 'revision': 'missing'})
+        self.assertTrue(saved['has_note'])
+        self.assertEqual((self.paper / 'note.md').read_text(), text)
+        self.assertEqual(local_note.read_text(), text)
+        self.assertNotEqual(saved['revision'], 'missing')
+        read = s.get_paper_note(self.topic, self.year, self.slug)
+        self.assertEqual(read['text'], text)
+        self.assertEqual(read['revision'], saved['revision'])
+        self.assertEqual(read['source'], 'remote')
+        self.assertTrue(read['has_note'])
+        self.assert_status(409, lambda: s.save_paper_note({
+            'topic': self.topic, 'year': self.year, 'slug': self.slug,
+            'text': 'stale', 'revision': 'missing'}))
+        self.assertEqual((self.paper / 'note.md').read_text(), text)
+        self.assert_status(400, lambda: s.save_paper_note({
+            'topic': self.topic, 'year': self.year, 'slug': self.slug,
+            'text': text[:-1], 'revision': 'bad'}))
+        cleared = s.save_paper_note({'topic': self.topic, 'year': self.year, 'slug': self.slug,
+                                     'text': '  \n', 'revision': read['revision']})
+        self.assertFalse(cleared['has_note'])
+        self.assertFalse((self.paper / 'note.md').exists())
+        self.assertFalse(local_note.exists())
+        self.assertEqual(s.get_paper_note(self.topic, self.year, self.slug)['revision'], 'missing')
+
+    def test_paper_note_falls_back_to_local_copy_when_remote_fails(self):
+        self.seed()
+        s = self.server
+        local_note = self.local / self.key / 'note.md'
+        local_note.parent.mkdir(parents=True)
+        local_note.write_text('# 本机草稿\n')
+        with patch.object(s, 'ssh_run', side_effect=HTTPException(502, 'remote down')):
+            result = s.get_paper_note(self.topic, self.year, self.slug)
+        self.assertEqual(result['source'], 'local')
+        self.assertTrue(result['has_note'])
+        self.assertIn('remote down', result['remote_error'])
+        self.assertEqual(result['text'], '# 本机草稿\n')
+
+    def test_paper_note_requires_a_remote_paper_directory(self):
+        s = self.server
+        self.assert_status(404, lambda: s.save_paper_note({
+            'topic': self.topic, 'year': self.year, 'slug': self.slug,
+            'text': 'x', 'revision': 'missing'}))
+
+    def test_paper_note_local_open_uses_mirror_and_refreshes_stale_copy(self):
+        self.seed()
+        s = self.server
+        local_note = self.local / self.key / 'note.md'
+        local_note.parent.mkdir(parents=True)
+        text = '# 结论\n\n- 关键公式 $x^2$\n'
+        s.save_paper_note({'topic': self.topic, 'year': self.year, 'slug': self.slug,
+                           'text': text, 'revision': 'missing'})
+        with patch.object(s.subprocess, 'Popen') as popen, \
+                patch.object(s.sys, 'platform', 'darwin'), \
+                patch.object(s, 'read_remote_note', return_value=(text, 'd' * 64)):
+            result = s.open_paper_note_local(self.topic, self.year, self.slug)
+        self.assertEqual(result['source'], 'local')
+        self.assertEqual(result['path'], str(local_note))
+        self.assertEqual(popen.call_args[0][0], ['open', str(local_note)])
+
+        local_note.unlink()
+        note, source = s.ensure_paper_note_local(self.topic, self.year, self.slug)
+        self.assertEqual((note, source), (local_note, 'pulled'))
+        self.assertEqual(note.read_text(encoding='utf-8'), text)
+
+        local_note.write_text('# 本机旧稿\n')
+        note, source = s.ensure_paper_note_local(self.topic, self.year, self.slug)
+        self.assertEqual(source, 'pulled')
+        self.assertEqual(note.read_text(encoding='utf-8'), text)
+
+        local_note.write_text('# 本机草稿\n')
+        with patch.object(s, 'ssh_run', side_effect=HTTPException(502, 'remote down')):
+            note, source = s.ensure_paper_note_local(self.topic, self.year, self.slug)
+        self.assertEqual((note, source), (local_note, 'local'))
+        self.assertEqual(note.read_text(encoding='utf-8'), '# 本机草稿\n')
+
+    def test_paper_note_local_open_requires_note_and_supported_system(self):
+        self.seed()
+        s = self.server
+        with patch.object(s.sys, 'platform', 'darwin'):
+            self.assert_status(404, lambda: s.open_paper_note_local(
+                self.topic, self.year, self.slug))
+            self.assert_status(400, lambda: s.open_paper_note_local(
+                '../escape', self.year, self.slug))
+        with patch.object(s.sys, 'platform', 'win32'):
+            self.assert_status(400, lambda: s.open_paper_note_local(
+                self.topic, self.year, self.slug))
 
     def test_research_external_revision_change_is_not_overwritten(self):
         self.local_copy()
@@ -669,6 +829,114 @@ class StorageTests(unittest.TestCase):
             self.assert_status(502, lambda: self.server.read_refs_doc('demo'))
             self.assert_status(502, lambda: self.server.add_project({'project': 'demo'}))
         self.assertEqual(file.read_bytes(), before)
+
+    def test_arxiv_abs_page_is_used_when_api_is_rate_limited(self):
+        page = b"""<html><body>
+<h1 class="title mathjax"><span class="descriptor">Title:</span> M3Former: Fine-Grained Cross-Layer Mixing</h1>
+<div class="authors"><span class="descriptor">Authors:</span>
+<a href="/a">Jiasong Han</a>, <a href="/a">Yunkai Chai</a>, <a href="/a">Tong Zhu</a></div>
+<td class="tablecell comments mathjax">Accepted at ICML 2026. <a href="https://x">code</a></td>
+<td class="tablecell subjects"><span class="primary-subject">Machine Learning (cs.LG)</span></td>
+<div class="submission-history"><h2>Submission history</h2><strong>[v1]</strong>
+Mon, 2 Nov 2026 02:57:47 UTC (149 KB)<br/></div>
+</body></html>"""
+        calls = []
+
+        def fake(url, timeout=120, limit=None, progress=None):
+            calls.append(url)
+            if "/api/query" in url:
+                raise self.server.HTTPException(503, "arXiv 请求过于频繁（429），请稍后重试")
+            return page
+
+        with patch.object(self.server, '_arxiv_http', fake):
+            info = self.server.arxiv_lookup('2611.02436')
+        self.assertEqual(info['title'], 'M3Former: Fine-Grained Cross-Layer Mixing')
+        self.assertEqual(info['authors'], ['Jiasong Han', 'Yunkai Chai', 'Tong Zhu'])
+        self.assertEqual(info['year'], 2026)
+        self.assertEqual(info['venue'], 'ICML')
+        self.assertEqual(info['category'], 'cs.LG')
+        self.assertEqual(info['published'], '2026-11-02T02:57:47Z')
+        self.assertEqual(calls, [
+            'https://export.arxiv.org/api/query?id_list=2611.02436',
+            'https://arxiv.org/abs/2611.02436',
+        ])
+
+    def test_arxiv_api_is_skipped_during_rate_limit_cooldown(self):
+        page = b"""<html><body>
+<h1 class="title mathjax">Fallback Title</h1>
+<div class="authors"><a href="/a">A B</a></div>
+<div class="submission-history"><strong>[v1]</strong> Mon, 2 Nov 2026 02:57:47 UTC</div>
+</body></html>"""
+        calls = []
+
+        def fake(url, timeout=120, limit=None, progress=None):
+            calls.append(url)
+            if "/api/query" in url:
+                raise AssertionError('API should be skipped during cooldown')
+            return page
+
+        with patch.object(self.server, '_arxiv_http', fake), \
+                patch.object(self.server, '_ARXIV_API_BLOCKED_UNTIL', float('inf')):
+            info = self.server.arxiv_lookup('2611.02436')
+        self.assertEqual(info['title'], 'Fallback Title')
+        self.assertEqual(calls, ['https://arxiv.org/abs/2611.02436'])
+
+    def test_arxiv_abs_fallback_keeps_not_found(self):
+        def fake(url, timeout=120, limit=None, progress=None):
+            raise self.server.HTTPException(404, "arXiv 文件确实不存在")
+
+        with patch.object(self.server, '_arxiv_http', fake):
+            self.assert_status(404, lambda: self.server.arxiv_lookup('0000.00000'))
+
+    def test_arxiv_preview_attaches_bibtex(self):
+        with patch.object(self.server, 'arxiv_lookup', return_value={'title': 'T'}), \
+                patch.object(self.server, '_arxiv_http',
+                             return_value=b'@misc{x,\n title={T}\n}\n'):
+            info = self.server.arxiv_preview('1706.03762')
+        self.assertEqual(info['title'], 'T')
+        self.assertEqual(info['bibtex'], '@misc{x,\n title={T}\n}')
+
+    def test_arxiv_preview_keeps_metadata_when_bibtex_fails(self):
+        def fake(url, timeout=120, limit=None, progress=None):
+            raise self.server.HTTPException(503, 'BibTeX 不可用')
+
+        with patch.object(self.server, 'arxiv_lookup', return_value={'title': 'T'}), \
+                patch.object(self.server, '_arxiv_http', fake):
+            info = self.server.arxiv_preview('1706.03762')
+        self.assertEqual(info['title'], 'T')
+        self.assertEqual(info['bibtex'], '')
+
+    def test_ieee_preview_attaches_crossref_bibtex(self):
+        with patch.object(self.server, 'ieee_lookup',
+                          return_value={'title': 'T', 'doi': '10.1109/X'}), \
+                patch.object(self.server.ieee_xplore, 'bibtex',
+                             return_value='@article{x, title={T}}'):
+            info = self.server.ieee_preview('10.1109/X')
+        self.assertEqual(info['bibtex'], '@article{x, title={T}}')
+
+    def test_remote_projects_are_read_in_one_ssh_round_trip(self):
+        self.project('demo', refs=[{'path': self.key, 'pdf': self.slug + '.pdf'}])
+        self.project('empty', refs=[])
+        self.server.save_projects(['demo', 'empty', 'missing'])
+        self.commands.clear()
+        out = self.server.projects('remote')
+        self.assertEqual(len(self.commands), 1)
+        by = {item['project']: item for item in out['items']}
+        self.assertEqual(by['demo']['count'], 1)
+        self.assertTrue(by['demo']['exists'] and by['demo']['has_refs'])
+        self.assertEqual(by['empty']['count'], 0)
+        self.assertTrue(by['empty']['exists'] and by['empty']['has_refs'])
+        self.assertFalse(by['missing']['exists'])
+        self.assertFalse(by['missing']['has_refs'])
+
+    def test_remote_project_batch_rejects_symlinks_and_corrupt_refs(self):
+        self.project('demo')
+        (self.workshop / 'link').symlink_to(self.workshop / 'demo')
+        self.server.save_projects(['demo', 'link'])
+        self.assert_status(502, lambda: self.server.projects('remote'))
+        (self.workshop / 'link').unlink()
+        (self.workshop / 'demo/reference-tex.json').write_text('{broken')
+        self.assert_status(500, lambda: self.server.projects('remote'))
 
     def test_corrupt_refs_are_not_overwritten(self):
         file = self.project()
@@ -1078,6 +1346,7 @@ class StorageTests(unittest.TestCase):
         local = self.local_copy()
         self.project(refs=[{'path': self.key, 'pdf': self.slug + '.pdf', 'note': 'keep'}])
         self.server.save_stars([self.key])
+        self.research_write(self.server.set_paper_tags, key=self.key, tags=['主题改名也要跟着走'])
         result = self.server.rename_topic({'topic': self.topic, 'new': 'NewTS',
                                            'revision': self.server.get_research()['revision']})
         self.assertFalse((self.remote / self.topic).exists())
@@ -1096,6 +1365,9 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(result['papers'], 1)
         self.assertEqual(result['meta_updated'], 1)
         self.assertTrue(result['local_moved'])
+        self.assertEqual(
+            self.server.get_research()['items']['NewTS/' + self.year + '/' + self.slug]['tags'],
+            ['主题改名也要跟着走'])
         self.assertEqual(result['projects_updated'], ['demo'])
         self.assertFalse(result['warnings'])
 
@@ -1742,6 +2014,38 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(response.headers['x-content-type-options'], 'nosniff')
         finally:
             Path(response.path).unlink(missing_ok=True)
+
+    def test_project_markdown_endpoint_reads_utf8_and_validates(self):
+        rel, folder = self.project_files_setup()
+        self.server.save_projects([str(folder)], source='local')
+        (folder / 'summary.md').write_bytes('\ufeff# 标题\n\n公式 $x^2$\n'.encode('utf-8'))
+        data = self.server.project_markdown(project=str(folder), path='summary.md', source='local')
+        self.assertEqual(data['project'], str(folder))
+        self.assertEqual(data['path'], 'summary.md')
+        self.assertEqual(data['text'], '# 标题\n\n公式 $x^2$\n')
+        self.assert_status(400, lambda: self.server.project_markdown(
+            project=str(folder), path='paper/main.pdf', source='local'))
+        self.assert_status(400, lambda: self.server.project_markdown(
+            project=str(folder), path='../outside.md', source='local'))
+        self.assert_status(403, lambda: self.server.project_markdown(
+            project=str(self.workshop / 'other'), path='summary.md', source='local'))
+        (folder / 'large.md').write_bytes(b'x' * (self.server.PROJECT_MARKDOWN_MAX_BYTES + 1))
+        self.assert_status(413, lambda: self.server.project_markdown(
+            project=str(folder), path='large.md', source='local'))
+
+    def test_project_markdown_endpoint_maps_remote_errors(self):
+        rel, _ = self.project_files_setup()
+        for code, status in ((44, 404), (45, 413), (73, 400), (1, 502)):
+            with self.subTest(code=code), patch.object(
+                    self.server, 'ssh_run',
+                    return_value=subprocess.CompletedProcess([], code, stdout=b'', stderr=b'x')):
+                self.assert_status(status, lambda: self.server.project_markdown(
+                    project=rel, path='notes.md', source='remote'))
+        with patch.object(
+                self.server, 'ssh_run',
+                return_value=subprocess.CompletedProcess([], 0, stdout='# hi'.encode(), stderr=b'')):
+            data = self.server.project_markdown(project=rel, path='notes.md', source='remote')
+        self.assertEqual((data['text'], data['size']), ('# hi', 4))
 
     def test_project_recent_endpoint_uses_requested_types_and_prunes_references(self):
         rel, _ = self.project_files_setup()

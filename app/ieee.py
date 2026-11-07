@@ -21,11 +21,13 @@ _API_HOSTS = {"api.crossref.org"}
 _DOC = "https://ieeexplore.ieee.org/document/{}/"
 _STAMP = "https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber={}&ref="
 _CROSSREF = "https://api.crossref.org/works/"
+_CROSSREF_BIBTEX = "https://api.crossref.org/works/{}/transform/application/x-bibtex"
 _DOI_REF = re.compile(r"^(?:doi:\s*)?(10\.\d{4,9}/[^\s\"'<>]+)$", re.I)
 _DOC_PATH = re.compile(r"^/(?:abstract/)?document/(\d{1,12})/?$")
 _NUMBER = re.compile(r"^\d{1,12}$")
 _MAX_PAGE = 4 * 1024 * 1024
 _MAX_JSON = 1024 * 1024
+_MAX_BIBTEX = 128 * 1024
 _USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
@@ -467,6 +469,28 @@ def lookup(ref, progress=None) -> dict:
     info["doi"] = info.get("doi") or doi
     info["arnumber"] = info.get("arnumber") or arnumber
     return info
+
+
+def bibtex(doi, progress=None) -> str:
+    """Fetch the Crossref BibTeX record for an IEEE DOI."""
+    if not isinstance(doi, str):
+        raise HTTPException(400, "DOI 必须是字符串")
+    doi = _clean_doi(doi)
+    if not _DOI_REF.fullmatch(doi) or not doi.lower().startswith("10.1109/"):
+        raise HTTPException(400, "只支持 IEEE 的 10.1109 DOI")
+    if progress:
+        progress("读取 Crossref BibTeX")
+    with _session() as client:
+        response = client.get(
+            _CROSSREF_BIBTEX.format(quote(doi, safe="/")), timeout=30,
+            limit=_MAX_BIBTEX, hosts=_API_HOSTS,
+        )
+    if response["status"] != 200:
+        raise _failure(response["status"], "Crossref BibTeX")
+    text = response["body"].decode("utf-8", "replace").strip()
+    if not text.startswith("@"):
+        raise HTTPException(502, "Crossref BibTeX 返回格式异常")
+    return text[:20000]
 
 
 def pdf_bytes(ref, progress=None) -> bytes:

@@ -153,6 +153,75 @@ class KnowledgeTests(unittest.TestCase):
         self.assertEqual((meta_path.parent / 'note.md').read_text(encoding='utf-8'), '新的正文')
         self.assertEqual(self.server.knowledge_detail(item['id'])['item']['body'], '新的正文')
 
+    def test_local_note_edit_is_reported_and_pushed_back(self):
+        item = self.create()['item']
+        mirror = self.local / '_knowledge' / item['id'] / 'note.md'
+        mirror.write_text('本机补写的第一行\n本机补写的第二行', encoding='utf-8')
+
+        detail = self.server.knowledge_detail(item['id'])
+        self.assertEqual(detail['local_edit']['body'], '本机补写的第一行\n本机补写的第二行')
+        self.assertFalse(detail['local_edit']['conflict'])
+
+        result = self.server.sync_knowledge_local(item['id'])
+        self.assertTrue(result['changed'])
+        self.assertEqual(result['warnings'], [])
+        self.assertEqual(result['item']['body'], '本机补写的第一行\n本机补写的第二行')
+        remote_note = self.remote / '_knowledge' / item['id'] / 'note.md'
+        self.assertEqual(remote_note.read_text(encoding='utf-8'), '本机补写的第一行\n本机补写的第二行')
+        self.assertEqual(mirror.read_text(encoding='utf-8'), '本机补写的第一行\n本机补写的第二行')
+        detail = self.server.knowledge_detail(item['id'])
+        self.assertEqual(detail['item']['body'], '本机补写的第一行\n本机补写的第二行')
+        self.assertIsNone(detail['local_edit'])
+
+    def test_untouched_mirror_has_no_local_edit(self):
+        item = self.create()['item']
+        self.assertIsNone(self.server.knowledge_detail(item['id'])['local_edit'])
+        result = self.server.sync_knowledge_local(item['id'])
+        self.assertFalse(result['changed'])
+
+    def test_local_note_conflict_keeps_local_until_overwrite(self):
+        item = self.create()['item']
+        folder = self.remote / '_knowledge' / item['id']
+        mirror = self.local / '_knowledge' / item['id'] / 'note.md'
+        mirror.write_text('本机版本', encoding='utf-8')
+        (folder / 'note.md').write_text('远端版本', encoding='utf-8')
+        meta = json.loads((folder / 'meta.json').read_text(encoding='utf-8'))
+        meta['updated_at'] = '2030-01-01T00:00:00Z'
+        (folder / 'meta.json').write_text(json.dumps(meta, ensure_ascii=False), encoding='utf-8')
+
+        detail = self.server.knowledge_detail(item['id'])
+        self.assertTrue(detail['local_edit']['conflict'])
+        self.assertEqual(detail['item']['body'], '远端版本')
+        self.assertEqual(detail['local_edit']['body'], '本机版本')
+        with self.assertRaises(HTTPException) as ctx:
+            self.server.sync_knowledge_local(item['id'])
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual((folder / 'note.md').read_text(encoding='utf-8'), '远端版本')
+
+        result = self.server.sync_knowledge_local(item['id'], overwrite=True)
+        self.assertTrue(result['changed'])
+        self.assertEqual((folder / 'note.md').read_text(encoding='utf-8'), '本机版本')
+
+    def test_sync_local_pull_discards_local_edit(self):
+        item = self.create()['item']
+        mirror = self.local / '_knowledge' / item['id'] / 'note.md'
+        mirror.write_text('临时本机版本', encoding='utf-8')
+        result = self.server.sync_knowledge_local(item['id'], mode='pull')
+        self.assertEqual(result['item']['body'], '第一行\n第二行')
+        self.assertEqual(mirror.read_text(encoding='utf-8'), '第一行\n第二行')
+        self.assertIsNone(self.server.knowledge_detail(item['id'])['local_edit'])
+
+    def test_legacy_mirror_without_digest_treats_local_edit_as_draft(self):
+        item = self.create()['item']
+        local_meta = self.local / '_knowledge' / item['id'] / 'meta.json'
+        meta = json.loads(local_meta.read_text(encoding='utf-8'))
+        meta.pop('body_sha256', None)
+        local_meta.write_text(json.dumps(meta, ensure_ascii=False), encoding='utf-8')
+        (self.local / '_knowledge' / item['id'] / 'note.md').write_text('旧镜像上的本机修改', encoding='utf-8')
+        detail = self.server.knowledge_detail(item['id'])
+        self.assertEqual(detail['local_edit']['body'], '旧镜像上的本机修改')
+        self.assertFalse(detail['local_edit']['conflict'])
+
     def test_update_and_delete_missing_items_return_404(self):
         missing = 'f' * 32
         with self.assertRaises(HTTPException) as ctx:
@@ -264,6 +333,105 @@ class KnowledgeTests(unittest.TestCase):
         self.assertEqual([ref['path'] for ref in stored['references']],
                          [note['key'], link['key']])
 
+    def test_add_batch_mixes_added_skipped_and_failed(self):
+        note = self.create()['item']
+        self.project(refs=[{'path': 'topic/2024/alpha', 'pdf': 'main.pdf'}])
+        papers = {
+            'topic/2024/alpha': {'has_pdf': True, 'pdf': 'main.pdf', 'title': '旧标题'},
+            'topic/2024/beta': {'has_pdf': True, 'pdf': 'beta.pdf', 'entry': 'ref.bib',
+                                'title': '新论文'},
+            'topic/2024/gamma': {'has_source': True, 'entry': 'ref.bib'},
+        }
+        with patch.object(self.server, 'scan_remote', return_value=papers):
+            result = self.server.add_refs_batch({
+                'project': 'demo',
+                'paths': ['topic/2024/alpha', 'topic/2024/beta', 'topic/2024/gamma',
+                          'topic/2024/beta', note['key'], 'topic/2024/missing'],
+            })
+            listed = self.server.get_refs('demo')['references']
+        self.assertEqual(result['added'],
+                         ['topic/2024/beta', 'topic/2024/gamma', note['key']])
+        self.assertEqual(result['skipped'], ['topic/2024/alpha'])
+        self.assertEqual(result['updated'], [])
+        self.assertEqual([item['path'] for item in result['failed']], ['topic/2024/missing'])
+        self.assertIn('库中没有', result['failed'][0]['message'])
+        self.assertFalse(result['created_dir'])
+        self.assertEqual(result['count'], 4)
+        stored = json.loads((self.workshop / 'demo/reference-tex.json').read_text(encoding='utf-8'))
+        self.assertEqual([ref['path'] for ref in stored['references']],
+                         ['topic/2024/alpha', 'topic/2024/beta', 'topic/2024/gamma', note['key']])
+        self.assertEqual(stored['references'][0], {'path': 'topic/2024/alpha', 'pdf': 'main.pdf'})
+        self.assertEqual(stored['references'][1]['title'], '新论文')
+        for ref in listed:
+            self.assertFalse(ref['missing'])
+
+    def test_add_batch_skips_existing_without_rewriting(self):
+        self.project(refs=[{'path': 'topic/2024/a', 'pdf': 'a.pdf', 'note': 'keep'}])
+        path = self.workshop / 'demo/reference-tex.json'
+        before = path.read_bytes()
+        papers = {'topic/2024/a': {'has_pdf': True, 'pdf': 'a.pdf', 'title': '新标题'}}
+        with patch.object(self.server, 'scan_remote', return_value=papers):
+            result = self.server.add_refs_batch({'project': 'demo', 'paths': ['topic/2024/a']})
+        self.assertEqual(result['skipped'], ['topic/2024/a'])
+        self.assertEqual(path.read_bytes(), before)
+        with patch.object(self.server, 'scan_remote', return_value=papers):
+            updated = self.server.add_refs_batch({'project': 'demo', 'update': True,
+                                                  'paths': ['topic/2024/a']})
+        self.assertEqual(updated['updated'], ['topic/2024/a'])
+        self.assertEqual(updated['skipped'], [])
+        stored = json.loads(path.read_text(encoding='utf-8'))
+        self.assertEqual(stored['references'][0]['title'], '新标题')
+
+    def test_add_batch_validates_input_and_bounds_size(self):
+        self.project()
+        for bad in (None, [], 'topic/2024/a', [None]):
+            with self.assertRaises(HTTPException) as ctx:
+                self.server.add_refs_batch({'project': 'demo', 'paths': bad})
+            self.assertEqual(ctx.exception.status_code, 400)
+        with self.assertRaises(HTTPException) as ctx:
+            self.server.add_refs_batch({'project': 'demo', 'path': 'x'})
+        self.assertEqual(ctx.exception.status_code, 400)
+        too_many = [f'topic/2024/p{i}' for i in range(self.server.REFS_BATCH_LIMIT + 1)]
+        with self.assertRaises(HTTPException) as ctx:
+            self.server.add_refs_batch({'project': 'demo', 'paths': too_many})
+        self.assertEqual(ctx.exception.status_code, 400)
+        with self.assertRaises(HTTPException) as ctx:
+            self.server.add_refs_batch({'project': 'demo', 'paths': ['../escape/x/y']})
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_add_batch_creates_missing_remote_project_after_confirm(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self.server.add_refs_batch({'project': 'ghost', 'paths': ['topic/2024/a']})
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertTrue(ctx.exception.detail['missing_dir'])
+        self.assertFalse((self.workshop / 'ghost').exists())
+        papers = {'topic/2024/a': {'has_pdf': True, 'pdf': 'a.pdf'}}
+        with patch.object(self.server, 'scan_remote', return_value=papers):
+            created = self.server.add_refs_batch({'project': 'ghost',
+                                                  'paths': ['topic/2024/a'],
+                                                  'create_missing': True})
+        self.assertTrue(created['created_dir'])
+        self.assertEqual(created['added'], ['topic/2024/a'])
+        self.assertTrue((self.workshop / 'ghost/reference-tex.json').is_file())
+
+    def test_add_batch_local_source_requires_existing_directory(self):
+        papers = {'topic/2024/a': {'has_pdf': True, 'pdf': 'a.pdf'}}
+        with patch.object(self.server, 'scan_local', return_value=papers):
+            with self.assertRaises(HTTPException) as ctx:
+                self.server.add_refs_batch({'project': str(self.root / 'nope'),
+                                            'source': 'local',
+                                            'paths': ['topic/2024/a']})
+            self.assertEqual(ctx.exception.status_code, 409)
+            self.assertTrue(ctx.exception.detail['missing_dir'])
+        project = self.root / 'local-project'
+        project.mkdir()
+        with patch.object(self.server, 'scan_local', return_value=papers):
+            result = self.server.add_refs_batch({'project': str(project), 'source': 'local',
+                                                 'paths': ['topic/2024/a']})
+        self.assertEqual(result['added'], ['topic/2024/a'])
+        self.assertEqual(result['source'], 'local')
+        self.assertTrue((project / 'reference-tex.json').is_file())
+
     def test_get_refs_marks_missing_and_stale_knowledge(self):
         item = self.create()['item']
         self.project()
@@ -326,7 +494,8 @@ class KnowledgeTests(unittest.TestCase):
 
     def test_open_local_uses_mirror_and_rejects_links(self):
         note = self.create()['item']
-        with patch.object(self.server.subprocess, 'Popen') as popen:
+        with patch.object(self.server.subprocess, 'Popen') as popen, \
+                patch.object(self.server, 'read_knowledge_remote', return_value=None):
             result = self.server.open_knowledge_local(note['id'])
         self.assertEqual(result['source'], 'local')
         args, _ = popen.call_args

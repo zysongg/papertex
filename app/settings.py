@@ -12,6 +12,7 @@ DEFAULTS = {
     "host": "127.0.0.1",
     "port": 8817,
     "local_library": "~/PaperLibrary",
+    "review_space": "~/ReviewSpace",
     "remote_name": "远端服务器",
     "ssh_alias": "",
     "ssh_host": "",
@@ -70,8 +71,8 @@ def _remote_path(value, label):
     return value
 
 
-def _local_path(value, label="本机库路径"):
-    value = _text(value, label) or DEFAULTS["local_library"]
+def _local_path(value, label="本机库路径", fallback=None):
+    value = _text(value, label) or (DEFAULTS["local_library"] if fallback is None else fallback)
     expanded = os.path.expanduser(value)
     if not expanded.startswith("/"):
         raise ValueError(f"{label}必须是绝对路径或以 ~ 开头")
@@ -104,6 +105,16 @@ def normalize(raw, strict=True):
     out["host"] = bind_host
     out["port"] = _port(raw.get("port", DEFAULTS["port"]), "监听端口")
     out["local_library"] = _local_path(raw.get("local_library"))
+    out["review_space"] = _local_path(raw.get("review_space"), "审稿目录",
+                                      DEFAULTS["review_space"])
+    lib_abs = os.path.abspath(os.path.expanduser(out["local_library"]))
+    review_abs = os.path.abspath(os.path.expanduser(out["review_space"]))
+    home_abs = os.path.abspath(os.path.expanduser("~"))
+    if (review_abs in (lib_abs, home_abs)
+            or not review_abs.startswith(home_abs + os.sep)
+            or lib_abs.startswith(review_abs + os.sep)
+            or review_abs.startswith(lib_abs + os.sep)):
+        raise ValueError("审稿目录必须是论文库之外的独立子目录")
 
     alias = _text(raw.get("ssh_alias"), "SSH 别名", 64)
     ssh_host = _text(raw.get("ssh_host"), "SSH 主机", 253)
@@ -198,6 +209,7 @@ def public(cfg):
         "host": cfg["host"],
         "port": cfg["port"],
         "local_library": cfg["local_library"],
+        "review_space": cfg.get("review_space", DEFAULTS["review_space"]),
         "remote_name": cfg["remote_name"],
         "connection": "alias" if cfg.get("ssh_alias") else (
             "direct" if cfg.get("ssh_host") else ""),

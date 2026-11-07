@@ -25,6 +25,7 @@ PDF_QUERY = b"source=remote&topic=TS&year=2025&slug=paper&token=" + PDF_SECRET.e
 PROJECT_QUERY = (
     b"project=project_ts%2FSRNet&path=paper%2Fmain.pdf&token=" + PDF_SECRET.encode("ascii")
 )
+REVIEW_QUERY = b"key=ICML%2F7&name=manuscript.pdf&token=" + PDF_SECRET.encode("ascii")
 
 
 def chunks(*parts):
@@ -268,6 +269,30 @@ class RequestGuardTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assert_status(result, 403)
                 self.assertEqual(result["entered"], 0)
+
+    async def test_cross_site_review_manuscript_read_follows_pdf_allowlist(self):
+        for method in ("GET", "HEAD"):
+            with self.subTest(method=method):
+                result = await self.invoke(
+                    method=method, headers=[HOST, CROSS_SITE], path="/api/review/pdf",
+                    query_string=REVIEW_QUERY, pdf_token=PDF_SECRET,
+                )
+                self.assert_status(result, 200)
+                self.assertEqual(result["entered"], 1)
+        for query in (b"key=ICML%2F7", b"key=ICML%2F7&token=wrong"):
+            with self.subTest(query=query):
+                result = await self.invoke(
+                    method="GET", headers=[HOST, CROSS_SITE], path="/api/review/pdf",
+                    query_string=query, pdf_token=PDF_SECRET,
+                )
+                self.assert_status(result, 403)
+                self.assertEqual(result["entered"], 0)
+        result = await self.invoke(
+            method="GET", headers=[HOST, CROSS_SITE], path="/api/review/trash",
+            query_string=REVIEW_QUERY, pdf_token=PDF_SECRET,
+        )
+        self.assert_status(result, 403)
+        self.assertEqual(result["entered"], 0)
 
     async def test_cross_site_pdf_read_with_bad_token_is_rejected(self):
         for query in (

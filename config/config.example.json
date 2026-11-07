@@ -2,6 +2,7 @@
   "host": "127.0.0.1",
   "port": 8817,
   "local_library": "~/PaperLibrary",
+  "review_space": "~/ReviewSpace",
   "remote_name": "research-server",
   "ssh_alias": "research-server",
   "ssh_host": "",

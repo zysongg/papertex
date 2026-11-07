@@ -14,6 +14,7 @@
   document.documentElement.dataset.theme = ['light', 'dark'].includes(preferredTheme)
     ? preferredTheme : (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
 </script>
+<link rel="stylesheet" href="/vendor/katex/katex.min.css">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -37,6 +38,7 @@
   <button data-tab="library" data-mode="link">链接</button>
   <button data-tab="upload">上传</button>
   <button data-tab="refs">项目空间</button>
+  <button data-tab="review">审稿</button>
 </nav>
 
 <main>
@@ -89,6 +91,17 @@
       <label class="filter-toggle"><input type="checkbox" id="only-gaps"> 只看单边</label>
       <label class="filter-toggle"><input type="checkbox" id="only-starred"> 只看星标 <span id="star-count" class="muted"></span></label>
       <span id="count" class="count-pill"></span>
+      <button id="select-toggle" type="button" class="ghost" aria-pressed="false"
+              title="勾选多篇论文或资料，一次加入项目">多选</button>
+    </div>
+    <div class="tag-filters hidden" id="tag-filters" role="group" aria-label="按标签筛选"></div>
+    <div id="bulk-bar" class="bulk-bar hidden" role="region" aria-label="批量操作">
+      <span id="bulk-count" class="bulk-count">已选 0 项</span>
+      <button id="bulk-all" type="button" class="ghost">全选当前筛选</button>
+      <button id="bulk-none" type="button" class="ghost">清空选择</button>
+      <span class="bulk-spacer"></span>
+      <button id="bulk-add-project" type="button" disabled>加入项目…</button>
+      <button id="bulk-exit" type="button" class="ghost">退出多选</button>
     </div>
     <div class="layout" id="library-layout">
       <div id="list" class="list">
@@ -110,87 +123,155 @@
   </section>
 
   <section id="tab-upload" class="tab">
-    <form id="upload-form" class="card form">
-      <h2>上传论文 <button type="button" id="options-refresh" class="ghost mini">刷新列表</button></h2>
-      <div class="row">
-        <label>主题
-          <select id="topic-select" name="topic_select"></select>
-          <input id="topic-new" name="topic_new" class="hidden" placeholder="新主题,如 TS-Example">
-        </label>
-        <label>年份
-          <select id="year-select" name="year_select"></select>
-          <input id="year-new" name="year_new" class="hidden" placeholder="如 2027">
-        </label>
+    <form id="upload-form" class="upload-form form">
+      <div class="upload-hero">
+        <div>
+          <h2>上传论文</h2>
+          <p class="muted">从 arXiv、OpenReview 或 IEEE 抓取元数据与 BibTeX，也可以直接上传 PDF。</p>
+        </div>
+        <button type="button" id="options-refresh" class="ghost mini">刷新列表</button>
       </div>
-      <div class="row">
-        <label>会议/期刊
-          <select id="venue-select" name="venue_select"></select>
-          <input id="venue-new" name="venue_new" class="hidden" placeholder="如 TSP">
-        </label>
-        <label>第一作者<input id="author-input" name="author" placeholder="如 Li"></label>
-        <label>关键词<input id="keyword-input" name="keyword" placeholder="如 Example"></label>
-      </div>
-      <label>slug
-        <div class="slug-row">
-          <input id="slug-input" name="slug" readonly placeholder="由 年份-会议-作者-关键词 自动生成">
-          <label class="check"><input type="checkbox" id="slug-manual"> 手动修改</label>
+
+      <section class="card upload-section">
+        <div class="upload-section-head">
+          <h3><span class="step-no">1</span>导入来源</h3>
+          <span class="muted upload-optional">元数据会自动填入下一步</span>
         </div>
-      </label>
-      <label>arXiv 链接或 ID
-        <div class="slug-row">
-          <input id="arxiv-url" name="arxiv_url" placeholder="https://arxiv.org/abs/2609.24444">
-          <button type="button" id="arxiv-parse" class="mini">抓取信息</button>
+        <div class="seg source-seg" id="source-seg" role="tablist" aria-label="论文来源">
+          <button type="button" data-source="arxiv" class="active" role="tab" aria-selected="true">arXiv</button>
+          <button type="button" data-source="openreview" role="tab" aria-selected="false">OpenReview</button>
+          <button type="button" data-source="ieee" role="tab" aria-selected="false">IEEE</button>
+          <button type="button" data-source="manual" role="tab" aria-selected="false">手动 / 仅文件</button>
         </div>
-      </label>
-      <div id="arxiv-status" class="muted arxiv-status"></div>
-      <label>OpenReview 链接
-        <div class="slug-row">
-          <input id="openreview-url" name="openreview_url" placeholder="https://openreview.net/forum?id=…">
-          <button type="button" id="openreview-parse" class="mini">抓取信息</button>
-          <button type="button" id="openreview-login-toggle" class="mini ghost">登录</button>
+
+        <div class="source-pane" data-source-pane="arxiv" role="tabpanel">
+          <div class="source-row">
+            <input id="arxiv-url" name="arxiv_url" placeholder="https://arxiv.org/abs/2609.24444" aria-label="arXiv 链接或 ID">
+            <button type="button" id="arxiv-parse" class="mini">抓取信息</button>
+          </div>
+          <div id="arxiv-status" class="source-status muted"></div>
+          <p class="source-hint">支持 abs / pdf 链接或裸 ID；会同时读取 arXiv 提供的 BibTeX。</p>
         </div>
-      </label>
-      <div id="openreview-status" class="muted arxiv-status"></div>
-      <label>IEEE 链接或 DOI
-        <div class="slug-row">
-          <input id="ieee-url" name="ieee_url" placeholder="https://ieeexplore.ieee.org/document/… 或 10.1109/…">
-          <button type="button" id="ieee-parse" class="mini">抓取信息</button>
+
+        <div class="source-pane hidden" data-source-pane="openreview" role="tabpanel">
+          <div class="source-row">
+            <input id="openreview-url" name="openreview_url" placeholder="https://openreview.net/forum?id=…" aria-label="OpenReview 链接">
+            <button type="button" id="openreview-parse" class="mini">抓取信息</button>
+            <button type="button" id="openreview-login-toggle" class="mini ghost">登录</button>
+          </div>
+          <div id="openreview-status" class="source-status muted"></div>
+          <div id="openreview-login" class="or-login hidden">
+            <div class="muted">OpenReview 现在要求登录后才能读取元数据和 PDF。账号只用于换取 token，token 保存在本机 config/openreview.json。</div>
+            <div class="row">
+              <label>邮箱 / 用户名<input id="openreview-user" autocomplete="username"></label>
+              <label>密码<input id="openreview-pass" type="password" autocomplete="current-password"></label>
+            </div>
+            <div class="row">
+              <button type="button" id="openreview-login-btn" class="mini">登录 OpenReview</button>
+              <span id="openreview-login-status" class="muted"></span>
+            </div>
+          </div>
         </div>
-      </label>
-      <div id="ieee-status" class="muted arxiv-status"></div>
-      <div id="openreview-login" class="or-login hidden">
-        <div class="muted">OpenReview 现在要求登录后才能读取元数据和 PDF。账号只用于换取 token，token 保存在本机 config/openreview.json。</div>
-        <div class="row">
-          <label>邮箱 / 用户名<input id="openreview-user" autocomplete="username"></label>
-          <label>密码<input id="openreview-pass" type="password" autocomplete="current-password"></label>
+
+        <div class="source-pane hidden" data-source-pane="ieee" role="tabpanel">
+          <div class="source-row">
+            <input id="ieee-url" name="ieee_url" placeholder="https://ieeexplore.ieee.org/document/… 或 10.1109/…" aria-label="IEEE 链接或 DOI">
+            <button type="button" id="ieee-parse" class="mini">抓取信息</button>
+          </div>
+          <div id="ieee-status" class="source-status muted"></div>
+          <p class="source-hint">需要能访问 IEEE 的校园网 / VPN；BibTeX 通过 Crossref 读取。</p>
         </div>
-        <div class="row">
-          <button type="button" id="openreview-login-btn" class="mini">登录 OpenReview</button>
-          <span id="openreview-login-status" class="muted"></span>
+
+        <div class="source-pane hidden" data-source-pane="manual" role="tabpanel">
+          <div class="source-note">不填写链接也可以：在下方选择 PDF 或源码包，再补全论文信息即可上传。</div>
         </div>
-      </div>
-      <div class="row">
-        <label>标题<input name="title" placeholder="可选"></label>
-        <label>arXiv<input name="arxiv" placeholder="可选"></label>
-        <label>代码链接<input name="code" placeholder="可选，https://github.com/…"></label>
-      </div>
-      <label>BibTeX（可选）
-        <textarea name="bibtex" rows="4" class="bib-input" placeholder="@article{key,&#10;  title = {…},&#10;  author = {…},&#10;  year = {2026},&#10;  journal = {…}&#10;}"></textarea>
-      </label>
-      <div class="muted bib-hint">粘贴一条 BibTeX 可补齐标题、会议/期刊、年份、作者、DOI；留空则跳过，只导入第一条。</div>
-      <div class="dropzone" id="dropzone">
-        <div class="dropzone-hint">拖拽 PDF / 源码包到这里，或点击下方选择</div>
-        <div class="row">
-          <label class="file">paper.pdf<input type="file" name="pdf" accept="application/pdf"></label>
-          <label class="file">源码包 (.zip/.tar.gz)<input type="file" name="source_archive"></label>
+      </section>
+
+      <section class="card upload-section">
+        <div class="upload-section-head">
+          <h3><span class="step-no">2</span>论文信息</h3>
+          <span class="muted upload-optional">抓取后自动填入，仍可修改</span>
         </div>
-        <div id="drop-status" class="muted"></div>
-      </div>
-      <label class="check"><input type="checkbox" name="fetch_source"> 已选 PDF 时也抓取 arXiv TeX 源码</label>
-      <label class="check"><input type="checkbox" name="copy_local" checked> 同时复制 pdf 到本机库</label>
-      <div class="actions">
-        <button type="submit">上传</button>
+        <div class="field-grid">
+          <label>主题
+            <select id="topic-select" name="topic_select"></select>
+            <input id="topic-new" name="topic_new" class="hidden" placeholder="新主题，如 TS-Example">
+          </label>
+          <label>年份
+            <select id="year-select" name="year_select"></select>
+            <input id="year-new" name="year_new" class="hidden" placeholder="如 2027">
+          </label>
+          <label>会议 / 期刊
+            <select id="venue-select" name="venue_select"></select>
+            <input id="venue-new" name="venue_new" class="hidden" placeholder="如 TSP">
+          </label>
+          <label>第一作者<input id="author-input" name="author" placeholder="如 Li"></label>
+          <label>关键词<input id="keyword-input" name="keyword" placeholder="如 Example"></label>
+          <div class="field slug-field">
+            <span class="field-label">slug</span>
+            <div class="slug-row">
+              <input id="slug-input" name="slug" readonly placeholder="自动生成">
+              <label class="check"><input type="checkbox" id="slug-manual"> 手动</label>
+            </div>
+          </div>
+          <label class="span-all">标题<input name="title" placeholder="抓取后自动填入，也可手动填写"></label>
+        </div>
+
+        <details class="more-ids">
+          <summary>更多标识<span class="muted">arXiv 编号、代码链接</span></summary>
+          <div class="field-grid two">
+            <label>arXiv<input name="arxiv" placeholder="如 2609.24444"></label>
+            <label>代码链接<input name="code" placeholder="https://github.com/…"></label>
+          </div>
+        </details>
+
+        <details class="bibtex-panel" id="bibtex-panel">
+          <summary>
+            <span class="bibtex-title">BibTeX</span>
+            <span id="bibtex-state" class="bibtex-state muted">抓取来源后自动填入，也可展开手动粘贴</span>
+          </summary>
+          <div class="bibtex-body">
+            <div class="bibtex-tools">
+              <span class="muted">只导入第一条；可用于补齐标题、作者、会议/期刊、DOI。</span>
+              <button type="button" id="bibtex-copy" class="mini ghost">复制</button>
+            </div>
+            <textarea name="bibtex" rows="6" class="bib-input" placeholder="@article{key,&#10;  title = {…},&#10;  author = {…},&#10;  year = {2026},&#10;  journal = {…}&#10;}"></textarea>
+          </div>
+        </details>
+      </section>
+
+      <section class="card upload-section">
+        <div class="upload-section-head">
+          <h3><span class="step-no">3</span>文件</h3>
+          <span class="muted upload-optional">可选</span>
+        </div>
+        <div class="dropzone" id="dropzone">
+          <div class="dropzone-hint">拖拽 PDF 或源码包到这里，也可以点击下方选择</div>
+          <div class="file-slots">
+            <label class="file-slot" id="pdf-file-slot">
+              <span class="file-kind">论文 PDF</span>
+              <span class="file-slot-name" id="pdf-file-name">未选择</span>
+              <span class="file-slot-hint">点击选择或拖入</span>
+              <input type="file" name="pdf" accept="application/pdf">
+            </label>
+            <label class="file-slot" id="src-file-slot">
+              <span class="file-kind">源码包</span>
+              <span class="file-slot-name" id="src-file-name">未选择</span>
+              <span class="file-slot-hint">.zip / .tar.gz</span>
+              <input type="file" name="source_archive" accept=".zip,.tar.gz,.tgz,.tar,application/zip,application/gzip">
+            </label>
+          </div>
+          <div id="drop-status" class="muted drop-status"></div>
+        </div>
+        <div class="upload-options">
+          <label class="check"><input type="checkbox" name="fetch_source"> 已选 PDF 时也抓取 arXiv TeX 源码</label>
+          <label class="check"><input type="checkbox" name="copy_local" checked> 同时复制 PDF 到本机库</label>
+        </div>
+      </section>
+
+      <div class="upload-submit">
         <span id="upload-result" class="muted"></span>
+        <button type="submit">上传</button>
       </div>
     </form>
   </section>
@@ -250,6 +331,29 @@
       </div>
     </div>
   </section>
+
+  <section id="tab-review" class="tab">
+    <div class="layout" id="review-layout">
+      <div class="list">
+        <div class="pad project-add-box">
+          <div class="section-label">审稿任务</div>
+          <div class="project-add-row">
+            <button id="review-new" type="button" class="mini primary">新建任务</button>
+            <button id="review-trash-btn" type="button" class="ghost mini">回收区</button>
+            <button id="review-refresh" type="button" class="ghost mini">刷新</button>
+          </div>
+          <div class="muted" id="review-root-text">稿件与评审只保存在本机审稿目录，不进论文库</div>
+        </div>
+        <div id="review-list"><p class="muted pad">加载中…</p></div>
+      </div>
+      <div class="splitter" id="review-splitter" role="separator" aria-orientation="vertical"
+           tabindex="0" aria-label="调整审稿列表宽度" title="拖动调整列表宽度，双击恢复默认"></div>
+      <div class="detail">
+        <h3>审稿 <span id="review-current" class="muted"></span></h3>
+        <div id="review-detail"><p class="muted pad">先在左侧新建或选择审稿任务</p></div>
+      </div>
+    </div>
+  </section>
 </main>
 
 <dialog id="confirm-modal" class="modal hidden" aria-labelledby="confirm-title" aria-describedby="confirm-text">
@@ -268,6 +372,26 @@
     <div class="confirm-actions">
       <button type="button" id="confirm-cancel" class="ghost">取消</button>
       <button type="button" id="confirm-ok">确认</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="bulk-modal" class="modal hidden" aria-labelledby="bulk-modal-title">
+  <div class="modal-box confirm-box" role="document">
+    <div class="modal-head">
+      <span id="bulk-modal-title" class="slug">批量加入项目</span>
+    </div>
+    <div class="confirm-body">
+      <p id="bulk-modal-hint"></p>
+      <label>
+        <span>目标项目</span>
+        <select id="bulk-project"></select>
+      </label>
+      <div id="bulk-status" class="muted bulk-status" role="status"></div>
+    </div>
+    <div class="confirm-actions">
+      <button type="button" id="bulk-cancel" class="ghost">取消</button>
+      <button type="button" id="bulk-ok">加入</button>
     </div>
   </div>
 </dialog>
@@ -299,6 +423,18 @@
     </div>
     <div id="image-preview-status" class="preview-status"></div>
     <div class="image-body" tabindex="0" aria-label="图片预览，方向键滚动"><img id="image-modal-img" alt="项目图片预览"></div>
+  </div>
+</dialog>
+<dialog id="markdown-modal" class="modal hidden" aria-labelledby="markdown-modal-title">
+  <div class="modal-box markdown-box">
+    <div class="modal-head">
+      <div class="markdown-heading">
+        <div id="markdown-modal-title" class="slug"></div>
+        <div id="markdown-modal-meta" class="muted"></div>
+      </div>
+      <button id="markdown-modal-close" class="mini ghost" autofocus>关闭</button>
+    </div>
+    <div id="markdown-modal-body" class="markdown-body markdown-scroll" tabindex="0"></div>
   </div>
 </dialog>
 <dialog id="mirror-modal" class="modal hidden" aria-labelledby="mirror-modal-title">
@@ -385,6 +521,37 @@
   </div>
 </dialog>
 
+<dialog id="note-modal" class="modal hidden" aria-labelledby="note-modal-title">
+  <div class="modal-box note-box">
+    <div class="modal-head">
+      <span id="note-modal-title" class="slug">论文笔记</span>
+      <button id="note-modal-close" type="button" class="mini ghost" autofocus>关闭</button>
+    </div>
+    <div id="note-modal-meta" class="note-modal-meta muted"></div>
+    <form id="note-form" class="note-form">
+      <div class="note-split">
+        <label class="note-pane">Markdown
+          <textarea id="note-text" rows="18" maxlength="200000" spellcheck="false"
+                    placeholder="## 一句话结论&#10;- 核心方法：&#10;- 复现要点：&#10;- 与我研究的关联：&#10;&#10;公式支持 $E=mc^2$ 与 $$…$$"></textarea>
+        </label>
+        <div class="note-pane note-preview-pane">
+          <span class="note-pane-label">预览</span>
+          <div id="note-preview" class="markdown-body note-preview"></div>
+        </div>
+      </div>
+      <div class="note-status-row">
+        <span id="note-status" class="muted" role="status"></span>
+        <span class="muted">⌘S / Ctrl+S 保存</span>
+      </div>
+      <div class="actions">
+        <button type="submit" id="note-save" class="primary">保存</button>
+        <button type="button" id="note-delete" class="danger">删除笔记</button>
+        <button type="button" id="note-cancel" class="ghost">取消</button>
+      </div>
+    </form>
+  </div>
+</dialog>
+
 <dialog id="settings-modal" class="modal hidden" aria-labelledby="settings-modal-title">
   <div class="modal-box settings-box">
     <div class="modal-head">
@@ -395,8 +562,10 @@
       <h2>本机</h2>
       <div class="row">
         <label>本机镜像库路径<input id="settings-local-library" placeholder="~/PaperLibrary"></label>
+        <label>审稿目录<input id="settings-review-space" placeholder="~/ReviewSpace"></label>
         <label>监听端口<input id="settings-port" inputmode="numeric" placeholder="8817"></label>
       </div>
+      <div class="muted">审稿目录必须独立于镜像库；审稿稿件与评审文本只写本机，不进论文库扫描。</div>
 
       <h2>远端服务器</h2>
       <label>显示名称<input id="settings-remote-name" placeholder="如 research-server 或 my-lab"></label>
@@ -433,7 +602,71 @@
   </div>
 </dialog>
 
+<dialog id="review-create-modal" class="modal hidden" aria-labelledby="review-create-title">
+  <div class="modal-box knowledge-box">
+    <div class="modal-head">
+      <span id="review-create-title" class="slug">新建审稿任务</span>
+      <button id="review-create-close" type="button" class="mini ghost" autofocus>关闭</button>
+    </div>
+    <form id="review-create-form" class="form">
+      <div class="row">
+        <label>会议/期刊目录名<input id="review-venue" placeholder="如 ICML-2026" autocomplete="off"></label>
+        <label>投稿号<input id="review-submission" placeholder="如 aX9kLm2" autocomplete="off"></label>
+      </div>
+      <label>稿件标题<input id="review-title" placeholder="投稿标题（可选）"></label>
+      <div class="row">
+        <label>会议全称<input id="review-venue-label" placeholder="如 ICML 2026" autocomplete="off"></label>
+        <label>轮次<input id="review-round" placeholder="如 R1" autocomplete="off"></label>
+        <label>截止日期<input id="review-due" type="date"></label>
+      </div>
+      <div class="row">
+        <label>状态<select id="review-status-select"></select></label>
+        <label>评审模板<select id="review-template-select"></select></label>
+      </div>
+      <div class="muted">目录名与投稿号只允许字母、数字、点、下划线、短横线；任务目录为 审稿目录/&lt;会议&gt;/&lt;投稿号&gt;/，只写本机。</div>
+      <div class="actions">
+        <button type="submit" class="mini primary">创建</button>
+        <span id="review-create-status" class="muted" role="status"></span>
+      </div>
+    </form>
+  </div>
+</dialog>
+
+<dialog id="review-trash-modal" class="modal hidden" aria-labelledby="review-trash-title">
+  <div class="modal-box panel-box">
+    <div class="modal-head">
+      <span id="review-trash-title" class="slug">审稿回收区</span>
+      <span id="review-trash-result" class="muted panel-status" role="status"></span>
+      <button id="review-trash-close" type="button" class="mini ghost" autofocus>关闭</button>
+    </div>
+    <div class="muted pad">彻底删除后稿件与评审文本不可恢复；确认文字必须逐字输入。</div>
+    <div id="review-trash-list" class="panel-list"></div>
+  </div>
+</dialog>
+
+<dialog id="review-export-modal" class="modal hidden" aria-labelledby="review-export-title">
+  <div class="modal-box knowledge-box">
+    <div class="modal-head">
+      <span id="review-export-title" class="slug">导出可粘贴文本</span>
+      <button id="review-export-close" type="button" class="mini ghost" autofocus>关闭</button>
+    </div>
+    <textarea id="review-export-text" class="review-export" readonly spellcheck="false"
+              aria-label="可粘贴的评审文本"></textarea>
+    <div class="actions">
+      <button type="button" id="review-export-copy" class="mini primary">复制到剪贴板</button>
+      <button type="button" id="review-export-download" class="mini ghost">下载 Markdown</button>
+      <span id="review-export-status" class="muted" role="status"></span>
+    </div>
+  </div>
+</dialog>
+
+<input type="file" id="review-pdf-input" accept="application/pdf,.pdf" class="hidden" aria-hidden="true">
+
 <div id="toasts" class="toasts" role="region" aria-label="通知" aria-live="polite"></div>
+<script src="/vendor/marked/marked.min.js"></script>
+<script src="/vendor/dompurify/purify.min.js"></script>
+<script src="/vendor/katex/katex.min.js"></script>
+<script src="/markdown.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

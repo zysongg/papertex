@@ -20,7 +20,7 @@
   const title = params.get('title') || '';
   const frame = document.getElementById('pdf-frame');
   if (title) document.title = title;
-  if (!/^\/api\/(pdf|project\/file)\?/.test(src)) {
+  if (!/^\/api\/(pdf|project\/file|review\/pdf)\?/.test(src)) {
     frame.remove();
     const message = document.createElement('p');
     message.textContent = '无效的预览地址';

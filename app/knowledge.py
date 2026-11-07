@@ -70,7 +70,7 @@ def _url(value):
     return value
 
 
-def _tags(value):
+def tags_list(value):
     if value is None:
         return []
     if isinstance(value, str):
@@ -112,7 +112,7 @@ def normalize(payload):
         "title": title,
         "url": url,
         "source": _text(payload.get("source"), "来源", MAX_SOURCE),
-        "tags": _tags(payload.get("tags")),
+        "tags": tags_list(payload.get("tags")),
         "body": _text(payload.get("body"), "正文", MAX_BODY, multiline=True),
     }
 

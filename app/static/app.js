@@ -68,6 +68,7 @@ const PROJECT_TYPES = [
   { id: 'jpg', label: 'JPG' },
   { id: 'webp', label: 'WebP' },
   { id: 'gif', label: 'GIF' },
+  { id: 'md', label: 'Markdown' },
 ];
 
 function loadProjectTypes() {
@@ -94,14 +95,18 @@ const state = {
   yearFilter: '',
   venueFilter: '',
   readingFilter: '', texFilter: '',
+  tagFilter: new Set(),
   knowledge: [],
   knowledgeError: '',
   knowledgeDraft: null,
   research: {},
   researchRevision: '',
   researchError: '',
+  metaCache: new Map(),
   onlyGaps: false,
   onlyStarred: false,
+  selectMode: false,
+  selected: new Set(),
   stars: new Set(),
   collapsed: new Set(loadCollapsed()),
   previewSource: null,
@@ -429,7 +434,9 @@ $$('.tabs button').forEach(btn => btn.onclick = () => {
   history.replaceState(null, '', '#' + btn.dataset.tab);
   if (btn.dataset.mode) setLibraryMode(btn.dataset.mode);
   if (btn.dataset.tab === 'refs') initRefs();
+  if (btn.dataset.tab === 'review') initReview();
   if (btn.dataset.tab === 'upload') loadOptions();
+  applyListWidth(splitState.width);
 });
 
 let setupPrompted = false;
@@ -477,6 +484,7 @@ function settingsPayload() {
     host: state.settingsHost || '127.0.0.1',
     port: Number.isFinite(port) ? port : 0,
     local_library: $('#settings-local-library').value.trim(),
+    review_space: $('#settings-review-space').value.trim(),
     remote_name: $('#settings-remote-name').value.trim(),
     ssh_alias: connection === 'alias' ? $('#settings-ssh-alias').value.trim() : '',
     ssh_host: connection === 'direct' ? $('#settings-ssh-host').value.trim() : '',
@@ -514,6 +522,7 @@ async function openSettings() {
     const s = await api('/api/settings');
     state.settingsHost = s.host || '127.0.0.1';
     $('#settings-local-library').value = s.local_library || '';
+    $('#settings-review-space').value = s.review_space || '';
     $('#settings-port').value = s.port || 8817;
     $('#settings-remote-name').value = s.remote_name || '';
     $('#settings-connection').value = s.connection === 'alias' ? 'alias' : 'direct';
@@ -628,13 +637,13 @@ async function loadLibrary() {
       state.knowledge = [];
       state.knowledgeError = knowledge.reason?.message || '资料读取失败';
     }
-    const blank = () => ({ has_pdf: false, pdf: '', has_source: false, entry: '', title: '', venue: '', code: '', openreview: '', doi: '', added_at: '' });
+    const blank = () => ({ has_pdf: false, pdf: '', has_source: false, has_note: false, entry: '', title: '', venue: '', code: '', openreview: '', doi: '', added_at: '' });
     const map = new Map();
     for (const it of local.value.items) {
       map.set(it.key, {
         key: it.key, kind: 'paper', topic: it.topic, year: it.year, slug: it.slug,
         local: {
-          has_pdf: it.has_pdf, pdf: it.pdf,
+          has_pdf: it.has_pdf, pdf: it.pdf, has_note: !!it.has_note,
           title: it.title || '', venue: it.venue || '',
           added_at: it.added_at || '',
         },
@@ -645,10 +654,10 @@ async function loadLibrary() {
       for (const it of remote.value.items) {
         const cur = map.get(it.key) || {
           key: it.key, kind: 'paper', topic: it.topic, year: it.year, slug: it.slug,
-          local: { has_pdf: false, pdf: '', title: '', venue: '' }, remote: blank(),
+          local: { has_pdf: false, pdf: '', has_note: false, title: '', venue: '' }, remote: blank(),
         };
         cur.remote = {
-          has_pdf: it.has_pdf, pdf: it.pdf, has_source: it.has_source,
+          has_pdf: it.has_pdf, pdf: it.pdf, has_source: it.has_source, has_note: !!it.has_note,
           entry: it.entry, title: it.title, venue: it.venue, code: it.code || '',
           openreview: it.openreview || '', doi: it.doi || '', added_at: it.added_at || '',
         };
@@ -770,17 +779,17 @@ function startTopicRename(row) {
     for (const element of form.elements) element.disabled = true;
     status.textContent = '处理中…';
     try {
-      const outcome = await runLongOperation('/api/topic/rename', {
+      const outcome = await retryAfterResearchRefresh(() => runLongOperation('/api/topic/rename', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ topic, new: name, revision: state.researchRevision }),
-      }, $('#topics-result'));
+      }, $('#topics-result')));
       if (state.topicFilter === topic) state.topicFilter = name;
       if (state.current?.topic === topic) {
         state.current = null;
         $('#detail').innerHTML = '<p class="muted pad">主题已重命名，请重新选择论文</p>';
       }
-      await Promise.all([loadTopics(true), loadLibrary(), loadOptions(true)]);
+      await Promise.all([loadTopics(true), loadLibrary(), loadOptions(true), loadResearch()]);
       $('#topics-result').innerHTML = `<span class="ok">已重命名为 ${esc(name)}</span>`;
       if (outcome.warnings?.length) toast(outcome.warnings.join('；'), 'warn');
     } catch (e) {
@@ -846,7 +855,8 @@ function sortByAdded(items) {
 }
 
 function populateFilters() {
-  const topics = [...new Set(state.items.map(i => i.topic))].sort();
+  const topics = [...new Set(state.items.map(i => i.topic))]
+    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
   const years = [...new Set(state.items.map(i => i.year))].sort().reverse();
   const venues = [...new Set(state.items.map(itemVenue).filter(Boolean))]
     .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
@@ -922,6 +932,7 @@ function setLibraryMode(mode, { keepDetail = false } = {}) {
   state.topicFilter = state.yearFilter = state.venueFilter = '';
   state.readingFilter = '';
   state.texFilter = '';
+  state.tagFilter.clear();
   state.onlyGaps = false;
   const gaps = $('#only-gaps');
   if (gaps) gaps.checked = false;
@@ -946,6 +957,10 @@ function filtered() {
         if (!['unread', 'reading', 'reproduce'].includes(status)) return false;
       } else if (status !== state.readingFilter) return false;
     }
+    if (state.tagFilter.size && !state.researchError) {
+      const tags = paperTags(it.key);
+      if (![...state.tagFilter].some(tag => tags.includes(tag))) return false;
+    }
     if (state.onlyGaps) {
       const l = it.local.has_pdf;
       const r = it.remote.has_pdf || it.remote.has_source;
@@ -953,7 +968,7 @@ function filtered() {
     }
     if (!q) return true;
     return (it.slug + ' ' + it.topic + ' ' + it.year + ' ' +
-      itemTitle(it) + ' ' + itemVenue(it))
+      itemTitle(it) + ' ' + itemVenue(it) + ' ' + paperTags(it.key).join(' '))
       .toLowerCase().includes(q);
   });
 }
@@ -973,10 +988,12 @@ function filteredKnowledge() {
 function knowledgeItemHtml(it) {
   const active = state.current && state.current.key === it.key;
   const starred = state.stars.has(it.key);
+  const picked = state.selected?.has(it.key);
   const sub = [it.source, ...(it.tags || []).slice(0, 3)].filter(Boolean).join(' · ');
   return `
-    <div class="item knowledge ${active ? 'active' : ''}" data-key="${esc(it.key)}"
+    <div class="item knowledge ${active ? 'active' : ''} ${picked ? 'picked' : ''}" data-key="${esc(it.key)}"
          role="button" tabindex="0" aria-current="${active ? 'true' : 'false'}">
+      ${state.selectMode ? pickBoxHtml(it.key, it.title || '资料') : ''}
       <div class="item-main">
         <div class="item-slug">${esc(it.title || '(未命名资料)')}</div>
         <div class="item-sub">${esc(sub || it.url || '')}</div>
@@ -996,22 +1013,146 @@ function compareBadges(it) {
     ${l ? '<span class="badge pdf">本机</span>' : ''}
     ${r ? `<span class="badge pdf">${esc(remoteLabel())}</span>` : ''}
     ${it.remote.has_source ? '<span class="badge tex">TEX</span>' : ''}
+    ${it.local.has_note || it.remote.has_note ? '<span class="badge note" title="已有论文笔记 note.md">Note</span>' : ''}
     ${/^https?:\/\//i.test(it.remote.code || '') ? '<span class="badge code">CODE</span>' : ''}
     ${gapsKnown && l && !remoteAny ? '<span class="badge warn">仅本机</span>' : ''}
     ${gapsKnown && !l && remoteAny ? `<span class="badge warn">仅 ${esc(remoteLabel())}</span>` : ''}`;
+}
+
+/* ---------- 资料多选与批量加入项目 ---------- */
+
+function pickKeys() {
+  const items = state.libraryMode === 'paper' ? filtered() : filteredKnowledge();
+  return items.map(it => it.key);
+}
+
+function togglePick(key) {
+  if (!state.selected) state.selected = new Set();
+  const on = !state.selected.has(key);
+  if (on) state.selected.add(key);
+  else state.selected.delete(key);
+  return on;
+}
+
+function pickBoxHtml(key, label) {
+  const on = state.selected?.has(key);
+  return `<input type="checkbox" class="pick" data-pick="${esc(key)}"${on ? ' checked' : ''}`
+    + ` aria-label="选择 ${esc(label)}">`;
+}
+
+function bulkSummaryText(result = {}) {
+  const added = (result.added || []).length;
+  const updated = (result.updated || []).length;
+  const skipped = (result.skipped || []).length;
+  const failed = result.failed || [];
+  const parts = [];
+  if (added) parts.push(`已加入 ${added} 项`);
+  if (updated) parts.push(`已更新 ${updated} 项`);
+  if (skipped) parts.push(`跳过 ${skipped} 项（项目里已有）`);
+  if (failed.length) {
+    const first = failed[0] || {};
+    const reason = first.message ? `${first.path}：${first.message}` : String(first.path || '');
+    parts.push(`失败 ${failed.length} 项${reason ? `（${reason}）` : ''}`);
+  }
+  return parts.join('，') || '没有需要加入的内容';
+}
+
+function updateBulkBar() {
+  const toggle = $('#select-toggle');
+  if (toggle) {
+    toggle.setAttribute('aria-pressed', state.selectMode ? 'true' : 'false');
+    toggle.classList.toggle('active', state.selectMode);
+    toggle.textContent = state.selectMode ? '多选中' : '多选';
+  }
+  const bar = $('#bulk-bar');
+  if (bar) bar.classList.toggle('hidden', !state.selectMode);
+  const selected = state.selected || new Set();
+  const count = $('#bulk-count');
+  if (count) count.textContent = `已选 ${selected.size} 项`;
+  const add = $('#bulk-add-project');
+  if (add) add.disabled = selected.size === 0;
+}
+
+function setSelectMode(on) {
+  state.selectMode = !!on;
+  if (!state.selectMode) state.selected.clear();
+  updateBulkBar();
+  renderList();
+}
+
+function groupPickHtml(attr, value, label) {
+  return `<input type="checkbox" class="group-pick" data-pick-${attr}="${esc(value)}"`
+    + ` aria-label="${esc(label)}" title="选择整个${attr === 'topic' ? '主题' : '年份'}">`;
+}
+
+function groupItemKeys(el) {
+  const body = el?.nextElementSibling;
+  if (!body || !body.querySelectorAll) return [];
+  return [...body.querySelectorAll('.item')].map(item => item.dataset.key).filter(Boolean);
+}
+
+function applyGroupSelection(keys) {
+  if (!state.selected) state.selected = new Set();
+  const all = keys.length > 0 && keys.every(key => state.selected.has(key));
+  for (const key of keys) {
+    if (all) state.selected.delete(key);
+    else state.selected.add(key);
+  }
+  return !all;
+}
+
+function toggleGroupPick(box) {
+  const host = box.closest('.group-topic, .group-year');
+  applyGroupSelection(groupItemKeys(host));
+  syncPickUI();
+}
+
+function syncGroupPickUI() {
+  $$('#list .group-pick').forEach(box => {
+    const keys = groupItemKeys(box.closest('.group-topic, .group-year'));
+    const chosen = keys.filter(key => state.selected?.has(key)).length;
+    box.checked = keys.length > 0 && chosen === keys.length;
+    box.indeterminate = chosen > 0 && chosen < keys.length;
+  });
+}
+
+function syncPickUI() {
+  $$('#list .item').forEach(el => {
+    const on = state.selected?.has(el.dataset.key) ?? false;
+    el.classList.toggle('picked', on);
+    const box = el.querySelector('.pick');
+    if (box) box.checked = on;
+  });
+  syncGroupPickUI();
+  updateBulkBar();
+}
+
+function clearPicks() {
+  if (!state.selected) state.selected = new Set();
+  state.selected.clear();
+  syncPickUI();
+}
+
+function selectVisible() {
+  if (!state.selected) state.selected = new Set();
+  for (const key of pickKeys()) state.selected.add(key);
+  syncPickUI();
+  toast(`已选中当前筛选的 ${state.selected.size} 项`, 'info');
 }
 
 function itemHtml(it, opts = {}) {
   if (it?.kind === 'note' || it?.kind === 'link') return knowledgeItemHtml(it);
   const title = itemTitle(it);
   const active = state.current && state.current.key === it.key;
+  const picked = state.selected?.has(it.key);
   const added = opts.context ? knowledgeDate(itemAddedAt(it)) : '';
   const context = opts.context
     ? `<div class="item-sub">${esc(it.topic)} · ${esc(it.year)}${added ? ' · 添加于 ' + esc(added) : ''}</div>`
     : '';
   return `
-    <div class="item ${active ? 'active' : ''}" data-key="${esc(it.key)}"
+    <div class="item ${active ? 'active' : ''} ${picked ? 'picked' : ''}" data-key="${esc(it.key)}"
          role="button" tabindex="0" aria-current="${active ? 'true' : 'false'}">
+      ${state.selectMode ? pickBoxHtml(it.key, it.slug) : ''}
       <div class="item-main">
         <div class="item-slug">${esc(it.slug)}</div>
         ${title ? `<div class="item-title">${esc(displayTitle(title))}</div>` : ''}
@@ -1039,8 +1180,24 @@ function bindListItems(focusedKey) {
     e.stopPropagation();
     toggleStar(btn.dataset.star);
   });
+  $$('#list .pick').forEach(box => {
+    box.onclick = e => e.stopPropagation();
+    box.onchange = () => {
+      togglePick(box.dataset.pick);
+      syncPickUI();
+    };
+  });
+  $$('#list .group-pick').forEach(box => {
+    box.onclick = e => e.stopPropagation();
+    box.onchange = () => toggleGroupPick(box);
+  });
   $$('#list .item').forEach(el => {
     const select = () => {
+      if (state.selectMode) {
+        togglePick(el.dataset.key);
+        syncPickUI();
+        return;
+      }
       const it = state.items.find(x => x.key === el.dataset.key) ||
         (state.knowledge || []).find(x => x.key === el.dataset.key);
       if (!it) return;
@@ -1096,6 +1253,7 @@ function renderKnowledgeList(count, starCount, focusedKey) {
 }
 
 function renderList() {
+  updateBulkBar();
   const gapsBox = $('#only-gaps');
   if (gapsBox) {
     if (state.remoteError) {
@@ -1115,6 +1273,7 @@ function renderList() {
   const count = $('#count');
   const starCount = $('#star-count');
   const focusedKey = document.activeElement?.closest?.('#list .item')?.dataset.key || '';
+  renderTagFilters();
   if (state.libraryMode !== 'paper') {
     renderKnowledgeList(count, starCount, focusedKey);
     return;
@@ -1171,6 +1330,7 @@ function renderList() {
         const yearOpen = searching || !state.collapsed.has(yKey);
         return `
           <div class="group-year ${yearOpen ? 'open' : ''}" data-toggle="${esc(yKey)}">
+            ${state.selectMode ? groupPickHtml('year', yKey, `选择 ${topic} ${year} 年`) : ''}
             <span class="chev"></span><span>${esc(year)}</span>
             <span class="count">${arr.length}</span>
           </div>
@@ -1178,6 +1338,7 @@ function renderList() {
       }).join('');
     return `
       <div class="group-topic ${topicOpen ? 'open' : ''}" data-toggle="${esc(topic)}">
+        ${state.selectMode ? groupPickHtml('topic', topic, `选择主题 ${topic}`) : ''}
         <span class="chev"></span><span>${esc(topic)}</span>
         <span class="count">${total}</span>
       </div>
@@ -1232,6 +1393,7 @@ async function supplementFile(kind, file, it) {
   if (st) st.textContent = '上传中…';
   try {
     await runLongOperation('/api/supplement', { method: 'POST', body: fd }, st);
+    state.metaCache.delete(it.key);
     await loadLibrary();
     const updated = state.items.find(x => x.key === it.key) || it;
     state.current = updated;
@@ -1267,22 +1429,53 @@ function editToggle(kind) {
   if (isNew) input.focus();
 }
 
+const metaRequests = new Map();
+
+function paperMeta(it) {
+  if (state.metaCache.has(it.key)) return Promise.resolve(state.metaCache.get(it.key));
+  if (!metaRequests.has(it.key)) {
+    const request = api('/api/meta?topic=' + encodeURIComponent(it.topic) +
+      '&year=' + encodeURIComponent(it.year) + '&slug=' + encodeURIComponent(it.slug))
+      .then(meta => {
+        const value = meta && typeof meta === 'object' ? meta : {};
+        state.metaCache.set(it.key, value);
+        return value;
+      })
+      .finally(() => metaRequests.delete(it.key));
+    metaRequests.set(it.key, request);
+  }
+  return metaRequests.get(it.key);
+}
+
 async function openEditor(it) {
+  const button = $('#btn-edit');
+  const status = $('#detail-status');
+  const cached = state.metaCache.has(it.key);
+  if (button && !cached) {
+    button.disabled = true;
+    button.textContent = '读取中…';
+  }
+  if (status && !cached) status.textContent = '正在读取远端元数据…';
   let meta = {};
   try {
-    meta = await api('/api/meta?topic=' + encodeURIComponent(it.topic) +
-      '&year=' + encodeURIComponent(it.year) + '&slug=' + encodeURIComponent(it.slug));
-  } catch (e) { toast(e.message, 'error'); return; }
-  if (!meta || typeof meta !== 'object') meta = {};
+    meta = await paperMeta(it);
+  } catch (e) {
+    if (button) {
+      button.disabled = false;
+      button.textContent = '编辑';
+    }
+    if (status) status.textContent = '';
+    toast(e.message, 'error');
+    return;
+  }
   const base = {
     slug: it.slug, topic: it.topic, year: Number(it.year),
     title: it.title || '', venue: it.venue || '', arxiv: '', entry: it.entry || '',
     ...meta,
   };
-  let opts = { topics: [], years: [] };
-  try { opts = await api('/api/options'); } catch (e) { /* ignore */ }
-  const topicList = [...new Set([...(opts.topics || []).map(t => t.name), base.topic])].sort();
-  const yearList = [...new Set([...(opts.years || []).map(String),
+  const topicList = [...new Set([...state.items.map(x => x.topic), base.topic])]
+    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+  const yearList = [...new Set([...state.items.map(x => String(x.year)),
     String(new Date().getFullYear()), String(base.year)])].sort().reverse();
 
   $('#detail').innerHTML = `
@@ -1354,14 +1547,17 @@ async function openEditor(it) {
     const st = $('#edit-status');
     if (st) st.textContent = '保存中…';
     try {
-      const r = await runLongOperation('/api/paper/edit', {
+      const r = await retryAfterResearchRefresh(() => runLongOperation('/api/paper/edit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           old: { topic: it.topic, year: it.year, slug: it.slug },
           meta: metaObj, revision: state.researchRevision,
         }),
-      }, st);
+      }, st));
+      state.metaCache.delete(it.key);
+      if (r.key) state.metaCache.delete(r.key);
+      if (r.key && r.key !== it.key) await loadResearch();
       await loadLibrary();
       const updated = state.items.find(x => x.key === r.key);
       state.current = updated || null;
@@ -1371,8 +1567,11 @@ async function openEditor(it) {
       if (r.warnings?.length) toast(r.warnings.join('；'), 'warn');
     } catch (e) {
       const st2 = $('#edit-status');
-      if (st2) st2.innerHTML = `<span class="error">${esc(e.message)}</span>`;
-      else toast(e.message, 'error');
+      const message = researchConflict(e)
+        ? '研究记录刚被其他操作（如批量导入）更新，已自动刷新；请再点一次「保存」'
+        : e.message;
+      if (st2) st2.innerHTML = `<span class="error">${esc(message)}</span>`;
+      else toast(message, 'error');
     }
   };
 
@@ -1499,12 +1698,33 @@ function addToProjectHtml(enabled, note = '') {
     <div class="actions-row">
       <label class="inline">加入项目
         <select id="add-proj-select" ${enabled ? '' : 'disabled'}>
-          <option value="">选择项目…</option>
+          <option value="">${enabled ? '正在读取项目…' : '选择项目…'}</option>
         </select>
       </label>
-      <button class="mini" id="btn-add-proj" ${enabled ? '' : 'disabled'}>加入</button>
+      <button class="mini" id="btn-add-proj" disabled>加入</button>
       <span id="add-proj-status" class="muted">${esc(note)}</span>
     </div>`;
+}
+
+async function loadProjectChoices() {
+  const sources = ['remote', 'local'];
+  const results = await Promise.allSettled(sources.map(src => fetchProjects(src)));
+  const choices = [];
+  let html = '<option value="">选择项目…</option>';
+  let failures = 0;
+  results.forEach((result, index) => {
+    if (result.status === 'rejected') { failures += 1; return; }
+    const items = result.value;
+    if (!items.length) return;
+    html += `<optgroup label="${esc(projectSourceLabel(sources[index]))}">`;
+    for (const item of items) {
+      const id = choices.length;
+      choices.push({ source: sources[index], project: item.project });
+      html += `<option value="${id}">${esc(item.project)}</option>`;
+    }
+    html += '</optgroup>';
+  });
+  return { choices, html, failures };
 }
 
 async function bindAddToProject(it) {
@@ -1512,31 +1732,25 @@ async function bindAddToProject(it) {
   const btn = $('#btn-add-proj');
   const st = $('#add-proj-status');
   if (!sel || !btn) return;
-  const choices = [];
+  const note = st ? st.textContent : '';
+  sel.disabled = true;
+  btn.disabled = true;
+  if (st && !note) st.textContent = '正在读取项目…';
+  let choices = [];
   try {
-    const sources = ['remote', 'local'];
-    const results = await Promise.allSettled(sources.map(src => fetchProjects(src)));
-    let html = '<option value="">选择项目…</option>';
-    let failures = 0;
-    results.forEach((result, index) => {
-      if (result.status === 'rejected') { failures += 1; return; }
-      const items = result.value;
-      if (!items.length) return;
-      html += `<optgroup label="${esc(projectSourceLabel(sources[index]))}">`;
-      for (const item of items) {
-        const id = choices.length;
-        choices.push({ source: sources[index], project: item.project });
-        html += `<option value="${id}">${esc(item.project)}</option>`;
-      }
-      html += '</optgroup>';
-    });
+    const loaded = await loadProjectChoices();
+    choices = loaded.choices;
+    sel.innerHTML = loaded.html;
+    sel.disabled = false;
     if (!choices.length) {
-      st.textContent = failures ? '项目读取失败，请稍后重试' : '还没有项目，先到「项目引用」添加';
+      st.textContent = loaded.failures ? '项目读取失败，请稍后重试' : '还没有项目，先到「项目引用」添加';
       return;
     }
-    sel.innerHTML = html;
     btn.disabled = false;
+    if (st) st.textContent = note;
   } catch (e) {
+    sel.innerHTML = '<option value="">选择项目…</option>';
+    sel.disabled = false;
     st.textContent = e.message;
     return;
   }
@@ -1613,6 +1827,114 @@ async function bindAddToProject(it) {
   };
 }
 
+let bulkChoices = [];
+
+function closeBulkModal() {
+  const modal = $('#bulk-modal');
+  if (!modal) return;
+  if (modal.open) modal.close();
+  modal.classList.add('hidden');
+}
+
+async function openBulkProjectModal() {
+  const paths = [...state.selected];
+  const modal = $('#bulk-modal');
+  const sel = $('#bulk-project');
+  const st = $('#bulk-status');
+  const ok = $('#bulk-ok');
+  const hint = $('#bulk-modal-hint');
+  if (!paths.length || !modal || !sel || !st || !ok) return;
+  if (typeof modal.showModal !== 'function') {
+    toast('当前浏览器不支持该对话框，请改用单个条目的「加入项目」', 'warn');
+    return;
+  }
+  bulkChoices = [];
+  if (hint) hint.textContent = `把已选的 ${paths.length} 项加入项目引用清单；项目里已有的会自动跳过。`;
+  st.textContent = '正在读取项目…';
+  st.classList.remove('warn-text');
+  ok.disabled = true;
+  ok.textContent = '加入';
+  sel.disabled = true;
+  sel.innerHTML = '<option value="">选择项目…</option>';
+  modal.classList.remove('hidden');
+  if (!modal.open) modal.showModal();
+  try {
+    const loaded = await loadProjectChoices();
+    bulkChoices = loaded.choices;
+    sel.innerHTML = loaded.html;
+    if (!loaded.choices.length) {
+      st.textContent = loaded.failures ? '项目读取失败，请稍后重试'
+        : '还没有项目，先到「项目引用」添加';
+      return;
+    }
+    sel.disabled = false;
+    ok.disabled = false;
+    st.textContent = loaded.failures ? '部分来源的项目读取失败；已有项目仍可选择' : '';
+  } catch (e) {
+    st.textContent = e.message;
+    st.classList.add('warn-text');
+  }
+}
+
+async function submitBulkAdd() {
+  const sel = $('#bulk-project');
+  const st = $('#bulk-status');
+  const ok = $('#bulk-ok');
+  if (!sel || !st || !ok) return;
+  const choice = bulkChoices[Number(sel.value)] || null;
+  if (!choice) {
+    st.textContent = '先选一个项目';
+    return;
+  }
+  const paths = [...state.selected];
+  if (!paths.length) {
+    st.textContent = '没有选中的条目';
+    return;
+  }
+  ok.disabled = true;
+  st.textContent = `正在加入 ${paths.length} 项…`;
+  const send = extra => runLongOperation('/api/refs/add-batch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project: choice.project, source: choice.source, paths, ...extra }),
+  }, st);
+  try {
+    let result;
+    try {
+      result = await send();
+    } catch (e) {
+      if (!(choice.source === 'remote' && e.status === 409 && e.detail?.missing_dir)) throw e;
+      st.textContent = '';
+      const yes = await confirmDialog({
+        title: '远端还没有这个项目目录',
+        text: `workshop 下不存在 ${choice.project}。确认后会创建该目录和 reference-tex.json，再把 ${paths.length} 项加入引用。`,
+        confirmLabel: '创建目录并加入',
+        danger: false,
+      });
+      if (!yes) {
+        st.textContent = '已取消，未创建目录';
+        ok.disabled = false;
+        return;
+      }
+      st.textContent = '正在创建目录…';
+      result = await send({ create_missing: true });
+    }
+    const summary = bulkSummaryText(result);
+    const failed = (result.failed || []).length;
+    invalidateProjects(choice.source);
+    touchProject(choice.project);
+    if (state.project === choice.project && state.projectSource === choice.source) loadRefs();
+    toast(`${choice.project}：${summary}`, failed ? 'warn' : 'ok', failed ? 9000 : 5000);
+    state.selected.clear();
+    setSelectMode(false);
+    closeBulkModal();
+  } catch (e) {
+    st.textContent = e.message;
+    st.classList.add('warn-text');
+    ok.disabled = false;
+  }
+}
+
 async function showDetail(it) {
   await loadPdfToken();
   const l = it.local;
@@ -1674,6 +1996,7 @@ async function showDetail(it) {
         <span class="muted">${state.remoteError ? '远端未读取，暂不可编辑远端字段或补传。' : '远端库没有对应目录，编辑远端字段与补传不可用。'}</span>
       </div>`}
     ${researchHtml(it)}
+    ${paperNoteHtml(it)}
     ${addToProjectHtml(remoteAny || l.has_pdf, remoteAny || l.has_pdf ? (remoteAny ? '' : '仅本机有这篇论文，只能加入本机项目')
       : (state.remoteError ? '远端离线且本机没有 pdf，暂时无法加入项目' : '两侧都没有 pdf，无法引用'))}
     ${anyPdf ? `
@@ -1746,6 +2069,7 @@ async function showDetail(it) {
   if ($('#add-proj-select') && !$('#add-proj-select').disabled) bindAddToProject(it);
   $('#btn-star').onclick = () => toggleStar(it.key);
   bindResearch(it);
+  bindPaperNote(it);
 }
 
 /* ---------- 资料（笔记/链接） ---------- */
@@ -1759,7 +2083,30 @@ function knowledgeDate(value) {
     `${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-function knowledgeDetailHtml(item, source, remoteError) {
+function knowledgeSyncHtml(edit) {
+  if (!edit) return '';
+  if (edit.reason) {
+    return `<div class="local-edit conflict">
+      <div class="local-edit-text"><strong>${esc(edit.reason)}</strong><span class="muted">请检查本机 note.md 后手动处理。</span></div>
+      <div class="actions-row"><button class="mini" id="btn-k-sync-pull">放弃本机文件，载入远端</button></div>
+    </div>`;
+  }
+  const when = edit.modified_at ? `修改于 ${esc(knowledgeDate(edit.modified_at))}` : '检测到本机修改';
+  if (!edit.conflict) {
+    return `<div class="local-edit">
+      <div class="local-edit-text"><strong>本机 note.md 有未同步的修改</strong><span class="muted">${when}，正在写回远端…</span></div>
+    </div>`;
+  }
+  return `<div class="local-edit conflict">
+    <div class="local-edit-text"><strong>本机 note.md 与远端都有更新</strong><span class="muted">${when}。请选择保留哪一份。</span></div>
+    <div class="actions-row">
+      <button class="mini" id="btn-k-sync-push">用本机内容覆盖远端</button>
+      <button class="mini" id="btn-k-sync-pull">放弃本机修改，载入远端</button>
+    </div>
+  </div>`;
+}
+
+function knowledgeDetailHtml(item, source, remoteError, localEdit = null) {
   const url = /^https?:\/\//i.test(item.url || '') ? item.url : '';
   const tags = Array.isArray(item.tags) ? item.tags : [];
   const label = item.kind === 'link' ? '链接' : '笔记';
@@ -1770,11 +2117,12 @@ function knowledgeDetailHtml(item, source, remoteError) {
       <dl><dt>类型</dt><dd>${label}</dd></dl>
       ${url ? `<dl><dt>链接</dt><dd><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url)}</a></dd></dl>` : ''}
       ${item.source ? `<dl><dt>来源</dt><dd>${esc(item.source)}</dd></dl>` : ''}
-      ${tags.length ? `<dl><dt>标签</dt><dd>${tags.map(tag => `<span class="tag-chip">${esc(tag)}</span>`).join(' ')}</dd></dl>` : ''}
+      ${tags.length ? `<dl><dt>标签</dt><dd>${tags.map(tag => `<span class="tag-chip ${tagTone(tag)}">${esc(tag)}</span>`).join(' ')}</dd></dl>` : ''}
       ${item.created_at ? `<dl><dt>创建</dt><dd>${esc(knowledgeDate(item.created_at))}</dd></dl>` : ''}
       ${item.updated_at ? `<dl><dt>更新</dt><dd>${esc(knowledgeDate(item.updated_at))}</dd></dl>` : ''}
       ${source === 'local' ? `<dl><dt>状态</dt><dd class="warn-text">远端离线，显示本机缓存${remoteError ? '：' + esc(remoteError) : ''}</dd></dl>` : ''}
     </div>
+    ${knowledgeSyncHtml(localEdit)}
     <div class="actions-row">
       <button class="mini" id="btn-k-edit">编辑</button>
       ${url ? '<button class="mini" id="btn-k-open">新标签页打开</button>' : ''}
@@ -1784,13 +2132,61 @@ function knowledgeDetailHtml(item, source, remoteError) {
       <span id="detail-status" class="muted"></span>
     </div>
     ${addToProjectHtml(true, source === 'remote' ? '' : '远端离线，只能加入本机项目')}
-    ${item.body ? `<pre class="knowledge-body">${esc(item.body)}</pre>` : '<p class="muted pad">没有正文</p>'}`;
+    ${item.body
+      ? `<div class="markdown-body knowledge-markdown">${PapertexMarkdown.render(item.body, { emptyText: '这份资料没有正文。' })}</div>`
+      : '<p class="muted pad">没有正文</p>'}`;
 }
 
-function bindKnowledgeDetail(item) {
+async function syncKnowledgeLocal(item, localEdit, { mode = 'push', overwrite = false } = {}) {
+  try {
+    const query = '?mode=' + encodeURIComponent(mode) + (overwrite ? '&overwrite=1' : '');
+    const result = await api('/api/knowledge/' + encodeURIComponent(item.id) + '/sync-local' + query,
+      { method: 'POST' });
+    const updated = result.item;
+    const listItem = { ...updated };
+    delete listItem.body;
+    const index = (state.knowledge || []).findIndex(entry => entry.key === updated.key);
+    if (index >= 0) state.knowledge[index] = listItem;
+    const stillCurrent = state.current && state.current.id === item.id;
+    if (stillCurrent) {
+      state.current = updated;
+      renderList();
+      $('#detail').innerHTML = knowledgeDetailHtml(updated, 'remote', '');
+      bindKnowledgeDetail(updated);
+    } else {
+      renderList();
+    }
+    return true;
+  } catch (e) {
+    if (e.status === 409 && localEdit) {
+      localEdit.conflict = true;
+      if (state.current && state.current.id === item.id) {
+        $('#detail').innerHTML = knowledgeDetailHtml(item, 'remote', '', localEdit);
+        bindKnowledgeDetail(item, localEdit);
+      }
+      toast('远端资料已有更新，本机修改尚未写回', 'warn');
+    } else {
+      toast(e.message, 'error');
+    }
+    return false;
+  }
+}
+
+function bindKnowledgeDetail(item, localEdit = null) {
   $('#btn-k-edit').onclick = () => openKnowledgeEditor(item);
   const open = $('#btn-k-open');
   if (open) open.onclick = () => window.open(item.url, '_blank', 'noopener');
+  const pushLocal = $('#btn-k-sync-push');
+  if (pushLocal) pushLocal.onclick = async () => {
+    const ok = await confirmDialog({
+      title: '用本机内容覆盖远端？',
+      text: '远端当前的修改会被本机 note.md 覆盖，操作会同步到其他设备。',
+      confirmLabel: '覆盖远端',
+    });
+    if (ok) syncKnowledgeLocal(item, localEdit, { overwrite: true });
+  };
+  const pullLocal = $('#btn-k-sync-pull');
+  if (pullLocal) pullLocal.onclick = () => syncKnowledgeLocal(item, localEdit, { mode: 'pull' });
   const openLocal = $('#btn-k-open-local');
   if (openLocal) openLocal.onclick = async () => {
     const status = $('#detail-status');
@@ -1831,17 +2227,22 @@ async function showKnowledgeDetail(it) {
   renderViewState($('#detail'), 'loading', '正在读取资料');
   try {
     const data = await api('/api/knowledge/' + encodeURIComponent(it.id), { cache: 'no-store' });
-    const item = data.item;
+    const localEdit = data.local_edit || null;
+    const item = localEdit ? { ...data.item, body: localEdit.body } : data.item;
     const index = (state.knowledge || []).findIndex(entry => entry.key === item.key);
     if (index >= 0) {
-      const meta = { ...item };
+      const meta = { ...data.item };
       delete meta.body;
       state.knowledge[index] = meta;
     }
     state.current = item;
     renderList();
-    $('#detail').innerHTML = knowledgeDetailHtml(item, data.source, data.remote_error);
-    bindKnowledgeDetail(item);
+    $('#detail').innerHTML = knowledgeDetailHtml(item, data.source, data.remote_error, localEdit);
+    bindKnowledgeDetail(item, localEdit);
+    if (localEdit && !localEdit.conflict) {
+      // 打开预览时把本机较新的 note.md 写回远端；失败会切换为冲突提示
+      syncKnowledgeLocal(item, localEdit);
+    }
   } catch (e) {
     renderViewState($('#detail'), 'error', '资料读取失败', e.message,
       () => showKnowledgeDetail(it));
@@ -2421,11 +2822,43 @@ const upSrcInput = form.querySelector('input[name="source_archive"]');
 const dropzone = $('#dropzone');
 const dropStatus = $('#drop-status');
 
+const sourceSeg = $('#source-seg');
+const sourcePanes = [...document.querySelectorAll('[data-source-pane]')];
+
+function activeSource() {
+  return sourceSeg.querySelector('button.active')?.dataset.source || 'manual';
+}
+
+function setSource(source) {
+  sourceSeg.querySelectorAll('button[data-source]').forEach(btn => {
+    const on = btn.dataset.source === source;
+    btn.classList.toggle('active', on);
+    btn.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  for (const pane of sourcePanes) {
+    const on = pane.dataset.sourcePane === source;
+    pane.classList.toggle('hidden', !on);
+    pane.querySelectorAll('input, button').forEach(el => { el.disabled = !on; });
+  }
+}
+
+sourceSeg.onclick = event => {
+  const button = event.target.closest('button[data-source]');
+  if (button) setSource(button.dataset.source);
+};
+setSource('arxiv');
+
 function showPickedFiles() {
-  const parts = [];
-  if (upPdfInput.files[0]) parts.push('pdf: ' + upPdfInput.files[0].name);
-  if (upSrcInput.files[0]) parts.push('源码: ' + upSrcInput.files[0].name);
-  dropStatus.textContent = parts.join(' · ');
+  const pairs = [
+    [upPdfInput, $('#pdf-file-name'), $('#pdf-file-slot')],
+    [upSrcInput, $('#src-file-name'), $('#src-file-slot')],
+  ];
+  for (const [input, name, slot] of pairs) {
+    const file = input.files[0];
+    name.textContent = file ? file.name : '未选择';
+    slot.classList.toggle('has-file', !!file);
+  }
+  dropStatus.textContent = '';
 }
 
 function setInputFiles(input, files) {
@@ -2536,6 +2969,45 @@ function applyLookupFields(d, fallbackVenue = 'arXiv', opts = {}) {
   composeSlug();
 }
 
+const bibtexInput = form.querySelector('textarea[name="bibtex"]');
+const bibtexPanel = $('#bibtex-panel');
+const bibtexState = $('#bibtex-state');
+
+function applyBibtex(d, label) {
+  const text = String((d && d.bibtex) || '').trim();
+  if (!text) {
+    bibtexPanel.classList.remove('ready');
+    bibtexState.innerHTML = '<span class="muted">未自动获取，可展开手动粘贴</span>';
+    if (bibtexInput.dataset.auto === '1') {
+      bibtexInput.value = '';
+      delete bibtexInput.dataset.auto;
+    }
+    return;
+  }
+  if (!bibtexInput.value.trim() || bibtexInput.dataset.auto === '1') {
+    bibtexInput.value = text + '\n';
+    bibtexInput.dataset.auto = '1';
+  }
+  bibtexPanel.classList.add('ready');
+  bibtexState.innerHTML = `<span class="ok">已自动获取</span>` +
+    `<span class="muted"> · ${esc(label)}</span>`;
+}
+
+bibtexInput.addEventListener('input', () => { bibtexInput.dataset.auto = '0'; });
+$('#bibtex-copy').onclick = async () => {
+  if (!bibtexInput.value.trim()) {
+    toast('还没有可复制的 BibTeX', 'warn');
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(bibtexInput.value);
+  } catch (e) {
+    bibtexInput.select();
+    document.execCommand('copy');
+  }
+  toast('BibTeX 已复制');
+};
+
 async function parseArxiv() {
   const raw = $('#arxiv-url').value.trim();
   const st = $('#arxiv-status');
@@ -2550,6 +3022,7 @@ async function parseArxiv() {
   try {
     const d = await runLongOperation('/api/arxiv/preview?url=' + encodeURIComponent(raw), {}, st);
     applyLookupFields(d);
+    applyBibtex(d, 'arXiv');
     st.innerHTML = `<span class="ok">${esc(displayTitle(d.title))}</span>` +
       (d.comment ? `<span class="muted"> · ${esc(d.comment)}</span>` : '') +
       `<span class="muted"> · ${esc((d.authors || []).join(', '))}</span>`;
@@ -2659,6 +3132,7 @@ async function parseOpenReview() {
   try {
     const d = await runLongOperation('/api/openreview/preview?url=' + encodeURIComponent(raw), {}, st);
     applyLookupFields(d, 'OpenReview');
+    applyBibtex(d, 'OpenReview');
     if (d.openreview_url) $('#openreview-url').value = d.openreview_url;
     st.innerHTML = `<span class="ok">${esc(displayTitle(d.title))}</span>` +
       (d.venue_raw ? `<span class="muted"> · ${esc(d.venue_raw)}</span>` : '') +
@@ -2705,6 +3179,7 @@ async function parseIeee() {
   try {
     const d = await runLongOperation('/api/ieee/preview?ref=' + encodeURIComponent(raw), {}, st);
     applyLookupFields(d, 'IEEE', { keepArxiv: true });
+    applyBibtex(d, 'IEEE / Crossref');
     lastIeeeDoi = d.doi || '';
     st.innerHTML = `<span class="ok">${esc(displayTitle(d.title))}</span>` +
       (d.venue_raw && d.venue_raw !== d.venue ? `<span class="muted"> · ${esc(d.venue_raw)}</span>` : '') +
@@ -2809,7 +3284,7 @@ async function doUpload(fd) {
     $('#slug-input').value = '';
     ['#topic-new', '#year-new', '#venue-new'].forEach(s => $(s).classList.add('hidden'));
     loadOptions(true);
-    await loadLibrary();
+    await Promise.all([loadLibrary(), loadResearch()]);
   } catch (e) {
     if (e.status === 409 && e.detail && e.detail.duplicates) {
       showDupPrompt(e.detail.duplicates, fd, e.detail.message || '库里可能已有相同论文');
@@ -2825,9 +3300,10 @@ async function doUpload(fd) {
 form.onsubmit = async (ev) => {
   ev.preventDefault();
   if (uploadPending) return;
-  const arxivUrl = $('#arxiv-url').value.trim();
-  const orUrl = $('#openreview-url').value.trim();
-  const ieeeUrl = $('#ieee-url').value.trim();
+  const source = activeSource();
+  const arxivUrl = source === 'arxiv' ? $('#arxiv-url').value.trim() : '';
+  const orUrl = source === 'openreview' ? $('#openreview-url').value.trim() : '';
+  const ieeeUrl = source === 'ieee' ? $('#ieee-url').value.trim() : '';
   if (!arxivUrl && orUrl && !$('#slug-input').value.trim()) {
     const meta = await parseOpenReview();
     if (!meta) return;
@@ -2869,7 +3345,7 @@ form.onsubmit = async (ev) => {
     title: (fd.get('title') || '').trim(),
     arxiv: (fd.get('arxiv') || '').trim(),
     openreview: orUrl,
-    doi: lastIeeeDoi,
+    doi: source === 'ieee' ? lastIeeeDoi : '',
     slug, topic, year,
   });
   try {
@@ -3319,7 +3795,7 @@ function renderProjectFiles() {
     const meta = [dir, byteText(file.size), projectTimeText(file.mtime)]
       .filter(Boolean).map(esc).join(' · ');
     rows.push(`<div class="file-row" data-file="${esc(path)}" data-type="${esc(file.type)}">
-      <span class="badge ${file.type === 'pdf' ? 'pdf' : 'tex'}">${esc(String(file.type || '').toUpperCase())}</span>
+      <span class="badge ${file.type === 'pdf' ? 'pdf' : (file.type === 'md' ? 'note' : 'tex')}">${esc(String(file.type || '').toUpperCase())}</span>
       <div class="file-main">
         <div class="slug">${esc(name)}</div>
         <div class="title">${meta}</div>
@@ -3348,6 +3824,7 @@ function renderProjectFiles() {
       const name = path.split('/').pop();
       row.querySelector('button').focus();
       if (row.dataset.type === 'pdf') openProjectPdf(path, name);
+      else if (row.dataset.type === 'md') openProjectMarkdown(path, name);
       else openProjectImage(path, name);
     };
   });
@@ -3377,6 +3854,62 @@ async function openProjectImage(path, title) {
   return openImagePreview(title || path, () => projectFileUrl(project, path, source));
 }
 
+let activeMarkdown = null;
+
+async function openProjectMarkdown(path, title) {
+  const project = state.project;
+  const source = state.projectSource;
+  const opener = activeMarkdown?.opener || document.activeElement;
+  if (activeMarkdown) closeMarkdownPreview();
+  const modal = $('#markdown-modal');
+  const body = $('#markdown-modal-body');
+  const session = { modal, opener, requestId: 0 };
+  activeMarkdown = session;
+  $('#markdown-modal-title').textContent = title || path.split('/').pop() || 'Markdown';
+  $('#markdown-modal-meta').textContent = path;
+  renderViewState(body, 'loading', '正在读取 Markdown', '只读预览，不会修改项目文件。');
+  modal.classList.remove('hidden');
+  modal.showModal();
+  document.body.classList.add('preview-open');
+  $('#markdown-modal-close').focus();
+  const load = async () => {
+    const requestId = ++session.requestId;
+    renderViewState(body, 'loading', '正在读取 Markdown', '只读预览，不会修改项目文件。');
+    try {
+      const url = `/api/project/markdown?project=${encodeURIComponent(project)}` +
+        `&source=${encodeURIComponent(source)}&path=${encodeURIComponent(path)}`;
+      const data = await api(url);
+      if (activeMarkdown !== session || requestId !== session.requestId) return;
+      $('#markdown-modal-meta').textContent = [path, byteText(data.size || 0)].join(' · ');
+      body.innerHTML = PapertexMarkdown.render(data.text, {
+        emptyText: '这个 Markdown 文件没有正文。',
+      });
+    } catch (e) {
+      if (activeMarkdown !== session || requestId !== session.requestId) return;
+      renderViewState(body, 'error', 'Markdown 读取失败', e.message, load);
+    }
+  };
+  await load();
+}
+
+function closeMarkdownPreview() {
+  if (!activeMarkdown) return;
+  const { modal, opener } = activeMarkdown;
+  activeMarkdown = null;
+  modal.close();
+  modal.classList.add('hidden');
+  $('#markdown-modal-body').innerHTML = '';
+  document.body.classList.remove('preview-open');
+  if (opener?.isConnected) opener.focus();
+}
+
+(() => {
+  const modal = $('#markdown-modal');
+  $('#markdown-modal-close').onclick = closeMarkdownPreview;
+  modal.onclick = e => { if (e.target === modal) closeMarkdownPreview(); };
+  modal.oncancel = e => { e.preventDefault(); closeMarkdownPreview(); };
+})();
+
 function refRow(r, i) {
   const cur = r.current || {};
   if (String(r.path || '').startsWith('_knowledge/')) {
@@ -3399,9 +3932,13 @@ function refRow(r, i) {
       </div>
       <div class="badges">${badges}</div>
       <input class="note" data-note="${i}" value="${esc(r.note || '')}" placeholder="备注">
+      ${(isNote && !r.missing) ? `<button type="button" class="mini note-toggle" data-note-toggle="${i}" aria-expanded="false" aria-controls="note-panel-${i}">预览笔记</button>` : ''}
       ${(isNote && !r.missing) ? `<button class="mini" data-open-local="${i}">用本地软件打开</button>` : ''}
       <button class="mini" data-sync="${i}" ${r.missing ? 'disabled' : ''}>按库更新</button>
       <button class="mini danger" data-remove="${i}">移除</button>
+      ${(isNote && !r.missing) ? `<div class="note-panel hidden" id="note-panel-${i}" role="region" aria-label="${esc(r.title || cur.title || '笔记')}">
+        <div class="markdown-body"></div>
+      </div>` : ''}
     </div>`;
   }
   const refCode = /^https?:\/\//i.test(r.code || '') ? r.code : '';
@@ -3435,6 +3972,47 @@ function refRow(r, i) {
     </div>`;
 }
 
+async function loadNotePreview(panel, body, id) {
+  body.innerHTML = '<p class="muted">正在读取笔记…</p>';
+  try {
+    const data = await api('/api/knowledge/' + encodeURIComponent(id));
+    const item = data.item || {};
+    body.innerHTML = PapertexMarkdown.render(item.body || '', {
+      emptyText: '这篇笔记还没有正文，可以点「用本地软件打开」继续写。',
+    });
+    panel.dataset.loaded = '1';
+  } catch (e) {
+    renderViewState(body, 'error', '笔记读取失败', e.message,
+      () => loadNotePreview(panel, body, id));
+  }
+}
+
+function toggleNotePreview(i, btn) {
+  const panel = document.getElementById('note-panel-' + i);
+  if (!panel) return;
+  const expanded = btn.getAttribute('aria-expanded') === 'true';
+  if (expanded) {
+    panel.classList.add('hidden');
+    btn.setAttribute('aria-expanded', 'false');
+    btn.textContent = '预览笔记';
+    return;
+  }
+  panel.classList.remove('hidden');
+  btn.setAttribute('aria-expanded', 'true');
+  btn.textContent = '收起笔记';
+  if (panel.dataset.loaded === '1') return;
+  const id = String(state.refs[i]?.path || '').split('/')[1] || '';
+  if (!id) {
+    panel.querySelector('.markdown-body').innerHTML =
+      '<p class="muted">无法识别这篇笔记的资料编号。</p>';
+    return;
+  }
+  if (panel.dataset.loading === '1') return;
+  panel.dataset.loading = '1';
+  loadNotePreview(panel, panel.querySelector('.markdown-body'), id)
+    .finally(() => { delete panel.dataset.loading; });
+}
+
 function renderRefs() {
   if (!state.refs.length) {
     renderViewState($('#refs-current'), 'empty', '这个项目还没有引用',
@@ -3459,6 +4037,9 @@ function renderRefs() {
       const source = state.refsSession?.source || 'remote';
       openPdfTab(() => paperPdfUrl(source, topic, year, slug), slug);
     };
+  });
+  $$('#refs-current button[data-note-toggle]').forEach(btn => {
+    btn.onclick = () => toggleNotePreview(Number(btn.dataset.noteToggle), btn);
   });
   $$('#refs-current button[data-open-local]').forEach(btn => {
     btn.onclick = async () => {
@@ -3625,6 +4206,17 @@ $('#collapse-all').onclick = () => {
 };
 $('#only-gaps').onchange = e => { state.onlyGaps = e.target.checked; renderList(); };
 $('#only-starred').onchange = e => { state.onlyStarred = e.target.checked; renderList(); };
+$('#select-toggle').onclick = () => setSelectMode(!state.selectMode);
+$('#bulk-exit').onclick = () => setSelectMode(false);
+$('#bulk-none').onclick = clearPicks;
+$('#bulk-all').onclick = selectVisible;
+$('#bulk-add-project').onclick = openBulkProjectModal;
+$('#bulk-cancel').onclick = closeBulkModal;
+$('#bulk-ok').onclick = submitBulkAdd;
+$('#bulk-modal').oncancel = e => {
+  e.preventDefault();
+  closeBulkModal();
+};
 $('#filter-reading').onchange = e => { state.readingFilter = e.target.value; renderList(); };
 $('#filter-tex').onchange = e => { state.texFilter = e.target.value; renderList(); };
 $('#refs-export-bib').onclick = exportProjectBibliography;
@@ -3829,12 +4421,120 @@ function researchRecord(key) {
   return state.research[key] || {};
 }
 
+function paperTags(key) {
+  const tags = researchRecord(key).tags;
+  return Array.isArray(tags) ? tags : [];
+}
+
+const TAG_TONES = 10;
+
+function tagTone(tag) {
+  let hash = 0;
+  for (const ch of String(tag)) hash = (hash * 31 + ch.codePointAt(0)) >>> 0;
+  return 'tag-c' + (hash % TAG_TONES);
+}
+
+function allPaperTags() {
+  const counts = new Map();
+  Object.keys(state.research).forEach(key => paperTags(key).forEach(tag =>
+    counts.set(tag, (counts.get(tag) || 0) + 1)));
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'zh-CN'));
+}
+
+function renderTagFilters() {
+  const host = $('#tag-filters');
+  if (!host) return;
+  if (state.libraryMode !== 'paper') {
+    host.innerHTML = '';
+    host.classList.add('hidden');
+    return;
+  }
+  const tags = state.researchError ? [] : allPaperTags();
+  const known = new Set(tags.map(entry => entry[0]));
+  [...state.tagFilter].filter(tag => !known.has(tag)).forEach(tag => state.tagFilter.delete(tag));
+  if (!tags.length) {
+    host.innerHTML = '';
+    host.classList.add('hidden');
+    return;
+  }
+  host.classList.remove('hidden');
+  host.innerHTML = '<span class="tag-filter-label">标签</span>' +
+    tags.map(([tag, count]) => `<button type="button" class="tag-chip pick ${tagTone(tag)}" data-tag="${esc(tag)}"
+      aria-pressed="${state.tagFilter.has(tag) ? 'true' : 'false'}"
+      title="${count} 篇">${esc(tag)} <span class="muted">${count}</span></button>`).join('') +
+    (state.tagFilter.size
+      ? '<button type="button" class="mini link" id="tag-clear">清除标签筛选</button>' : '');
+  host.querySelectorAll('[data-tag]').forEach(btn => {
+    btn.onclick = () => {
+      const tag = btn.dataset.tag;
+      if (state.tagFilter.has(tag)) state.tagFilter.delete(tag);
+      else state.tagFilter.add(tag);
+      syncSearch();
+      renderList();
+    };
+  });
+  const clear = host.querySelector('#tag-clear');
+  if (clear) clear.onclick = () => { state.tagFilter.clear(); syncSearch(); renderList(); };
+}
+
+function bindTagEditor(panel, it) {
+  const editor = panel.querySelector('#tag-editor');
+  const form = panel.querySelector('#tag-form');
+  const input = panel.querySelector('#tag-input');
+  const result = panel.querySelector('#tag-result');
+  if (!editor || !form) return;
+  const paint = () => {
+    const tags = paperTags(it.key);
+    editor.innerHTML = tags.length
+      ? tags.map(tag => `<button type="button" class="tag-chip removable ${tagTone(tag)}" data-tag="${esc(tag)}"
+          aria-label="移除标签 ${esc(tag)}" title="点击移除">${esc(tag)} ✕</button>`).join('')
+      : '<span class="muted">还没有标签</span>';
+    panel.querySelector('#tag-options').innerHTML = allPaperTags()
+      .map(([tag]) => `<option value="${esc(tag)}"></option>`).join('');
+    editor.querySelectorAll('[data-tag]').forEach(btn => {
+      btn.onclick = async () => {
+        await save(paperTags(it.key).filter(tag => tag !== btn.dataset.tag));
+      };
+    });
+  };
+  const save = async tags => {
+    input.disabled = true;
+    result.textContent = '保存中…';
+    try {
+      await saveResearch('/api/tags', { key: it.key, tags });
+      result.textContent = '已保存';
+    } catch (e) {
+      result.textContent = e.message;
+    } finally {
+      input.disabled = false;
+      input.value = '';
+      paint();
+      input.focus();
+    }
+  };
+  form.onsubmit = async event => {
+    event.preventDefault();
+    const typed = input.value.split(/[,，]/).map(part => part.trim()).filter(Boolean);
+    if (!typed.length) {
+      result.textContent = '标签不能为空';
+      return;
+    }
+    await save(paperTags(it.key).concat(typed));
+  };
+  paint();
+}
+
 function researchBadge(key) {
   if (state.researchError) return '';
   const record = researchRecord(key);
   const label = READING_LABELS[record.status];
+  const tags = paperTags(key).map(tag => {
+    const hit = state.tagFilter.has(tag);
+    return `<span class="badge item-tag ${tagTone(tag)}${hit ? ' tag-hit' : ''}">#${esc(tag)}</span>`;
+  });
   return (record.status && label ? `<span class="badge reading-badge">${esc(label)}</span>` : '') +
-    (record.version_group ? '<span class="badge">关联版本</span>' : '');
+    (record.version_group ? '<span class="badge">关联版本</span>' : '') + tags.join('');
 }
 
 async function loadResearch() {
@@ -3849,6 +4549,7 @@ async function loadResearch() {
   }
   const filter = $('#filter-reading');
   filter.disabled = !!state.researchError;
+  renderTagFilters();
 }
 
 async function saveResearch(url, payload, revision = state.researchRevision) {
@@ -3875,6 +4576,23 @@ async function saveResearch(url, payload, revision = state.researchRevision) {
   }
 }
 
+function researchConflict(error) {
+  return !!error && error.status === 409 && /研究记录已改变|缺少 revision/.test(String(error.message || ''));
+}
+
+// 论文编辑与主题重命名在改动目录名时会迁移研究记录，服务端在写入任何文件之前就用 revision 校验拦下，
+// 刷新记录后重试一次不会产生重复写入，可避免用户整页刷新、重填表单。
+async function retryAfterResearchRefresh(run) {
+  try {
+    return await run();
+  } catch (error) {
+    if (!researchConflict(error)) throw error;
+    await loadResearch();
+    if (state.researchError) throw error;
+    return await run();
+  }
+}
+
 function researchOptions(labels, selected) {
   return Object.entries(labels).map(([value, label]) =>
     `<option value="${esc(value)}" ${value === selected ? 'selected' : ''}>${esc(label)}</option>`).join('');
@@ -3891,6 +4609,19 @@ function researchHtml(it) {
         <label>一句话结论<textarea name="note" rows="2" maxlength="1000" placeholder="这篇论文对我的研究有什么用？">${esc(record.note || '')}</textarea></label>
         <div class="actions-row"><button class="mini primary" type="submit">保存阅读记录</button><span class="muted" role="status" id="reading-result"></span></div>
       </form>
+    </details>
+    <details open class="research-section">
+      <summary>标签 · 跨主题横切，可多值</summary>
+      <div class="research-form tag-editor-wrap">
+        <div class="tag-editor" id="tag-editor"></div>
+        <form id="tag-form" class="tag-add">
+          <input id="tag-input" list="tag-options" maxlength="40" autocomplete="off"
+                 placeholder="新增标签，回车保存" aria-label="新增标签">
+          <button class="mini primary" type="submit">添加</button>
+        </form>
+        <datalist id="tag-options"></datalist>
+        <span class="muted" role="status" id="tag-result"></span>
+      </div>
     </details>
     <details id="citation-section" class="research-section">
       <summary>引用 · BibTeX / LaTeX</summary>
@@ -3937,6 +4668,7 @@ function bindResearch(it) {
     }
   };
   form.oninput = () => { panel.querySelector('#reading-result').textContent = '尚未保存'; };
+  bindTagEditor(panel, it);
   const section = panel.querySelector('#citation-section');
   let loaded = false;
   section.ontoggle = () => {
@@ -3950,6 +4682,282 @@ function bindResearch(it) {
   versions.ontoggle = () => {
     if (versions.open) renderVersions(it, panel.querySelector('#versions-content'));
   };
+}
+
+/* ---------- 论文笔记（note.md） ---------- */
+
+function noteQueryParams(it) {
+  return '?topic=' + encodeURIComponent(it.topic) +
+    '&year=' + encodeURIComponent(it.year) + '&slug=' + encodeURIComponent(it.slug);
+}
+
+function noteQuery(it) {
+  return '/api/paper/note' + noteQueryParams(it);
+}
+
+function paperNoteHtml(it) {
+  return `<div class="research-panel paper-note" id="paper-note-panel" data-key="${esc(it.key)}">
+    <details open class="research-section">
+      <summary>论文笔记 · Markdown<span class="note-path">${esc(it.slug)}/note.md</span></summary>
+      <div class="research-form">
+        <div id="paper-note-body" class="paper-note-body"><p class="muted">正在读取笔记…</p></div>
+        <div class="actions-row">
+          <button class="mini primary" id="panel-note-edit" type="button" disabled>写笔记</button>
+          <button class="mini" id="panel-note-open" type="button" disabled title="用系统默认编辑器打开本机镜像里的 note.md">用本地软件打开</button>
+          <button class="mini" id="panel-note-delete" type="button" disabled>删除笔记</button>
+          <span class="muted" role="status" id="paper-note-status"></span>
+        </div>
+      </div>
+    </details>
+  </div>`;
+}
+
+function bindPaperNote(it) {
+  const panel = $('#paper-note-panel');
+  if (!panel) return;
+  const body = panel.querySelector('#paper-note-body');
+  const status = panel.querySelector('#paper-note-status');
+  const editBtn = panel.querySelector('#panel-note-edit');
+  const openBtn = panel.querySelector('#panel-note-open');
+  const delBtn = panel.querySelector('#panel-note-delete');
+  const note = { text: '', revision: 'missing', hasNote: false, source: 'remote',
+    byteSize: 0, recovery: '', remoteError: '' };
+
+  const paint = () => {
+    const editable = !state.remoteError && !note.remoteError;
+    editBtn.disabled = !editable;
+    openBtn.disabled = !note.hasNote;
+    delBtn.disabled = !editable || !note.hasNote;
+    editBtn.textContent = note.hasNote ? '编辑笔记' : '写笔记';
+    editBtn.title = editable ? '' : '远端离线，暂时只能查看本机缓存副本';
+    let main;
+    if (note.hasNote) {
+      main = `<div class="markdown-body paper-note-md">${PapertexMarkdown.render(note.text, { emptyText: '' })}</div>`;
+    } else if (note.recovery) {
+      main = `<p class="muted">远端还没有 note.md，但本机留有旧副本。</p>
+        <button class="mini" id="note-restore" type="button">用本机副本恢复</button>`;
+    } else {
+      main = '<p class="muted">还没有笔记。点「写笔记」记录结论、方法要点或复现坑点，保存为远端论文目录下的 note.md。</p>';
+    }
+    const warn = note.remoteError
+      ? `<p class="warn-text">${esc(note.remoteError)}，当前显示的是本机缓存副本。</p>` : '';
+    const meta = note.hasNote
+      ? `<div class="muted note-meta">${note.source === 'local' ? '本机缓存' : '远端'} · ${byteText(note.byteSize)}</div>` : '';
+    body.innerHTML = main + warn + meta;
+    const restore = body.querySelector('#note-restore');
+    if (restore) restore.onclick = () => openNoteEditor(it, note, { text: note.recovery, revision: 'missing' });
+  };
+
+  note.afterSave = () => {
+    paint();
+    const entry = state.items.find(x => x.key === it.key);
+    if (entry) {
+      entry.local.has_note = note.hasNote;
+      if (entry.remote) entry.remote.has_note = note.hasNote;
+      renderList();
+    }
+    status.textContent = '已保存 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  };
+
+  editBtn.onclick = () => openNoteEditor(it, note);
+  openBtn.onclick = async () => {
+    openBtn.disabled = true;
+    try {
+      await api('/api/paper/note/open' + noteQueryParams(it), { method: 'POST' });
+    } catch (e) {
+      toast(e.message, 'error');
+    } finally {
+      openBtn.disabled = !note.hasNote;
+    }
+  };
+  delBtn.onclick = async () => {
+    const ok = await confirmDialog({
+      title: `删除 ${it.slug} 的笔记`,
+      text: '远端论文目录下的 note.md 会被删除，本机镜像同步删除；论文本身不受影响。',
+      confirmLabel: '删除笔记',
+    });
+    if (!ok) return;
+    delBtn.disabled = true;
+    status.textContent = '删除中…';
+    try {
+      const data = await api('/api/paper/note', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ topic: it.topic, year: it.year, slug: it.slug, text: '', revision: note.revision }),
+      });
+      Object.assign(note, { text: '', revision: data.revision || 'missing', hasNote: false,
+        byteSize: 0, recovery: '', remoteError: '', source: 'remote' });
+      note.afterSave();
+      status.textContent = '已删除 note.md';
+    } catch (e) {
+      status.textContent = e.message;
+      paint();
+    }
+  };
+
+  const load = async () => {
+    body.innerHTML = '<p class="muted">正在读取笔记…</p>';
+    try {
+      const data = await api(noteQuery(it), { cache: 'no-store' });
+      if (!panel.isConnected) return;
+      Object.assign(note, {
+        text: data.text || '',
+        revision: data.revision || 'missing',
+        hasNote: !!data.has_note,
+        source: data.source || 'remote',
+        byteSize: data.byte_size || 0,
+        recovery: data.recovery_text || '',
+        remoteError: data.remote_error ? `远端读取失败（${data.remote_error}）` : '',
+      });
+      paint();
+    } catch (e) {
+      if (!panel.isConnected) return;
+      body.innerHTML = `<p class="warn-text">笔记读取失败：${esc(e.message)}</p>`;
+      editBtn.disabled = true;
+      delBtn.disabled = true;
+    }
+  };
+  load();
+}
+
+let activeNoteEditor = null;
+
+function notePreviewHtml(text) {
+  if (!text.trim()) return '<p class="muted">左侧输入 Markdown，这里实时预览；支持 $…$ 行内公式与 $$…$$ 块级公式。</p>';
+  return PapertexMarkdown.render(text, { emptyText: '' });
+}
+
+function closeNoteEditor() {
+  const session = activeNoteEditor;
+  if (!session) return;
+  activeNoteEditor = null;
+  clearTimeout(session.timer);
+  const { modal, textarea } = session;
+  if (modal.open) modal.close();
+  modal.classList.add('hidden');
+  document.body.classList.remove('preview-open');
+  textarea.oninput = null;
+  textarea.onkeydown = null;
+  modal.onclick = null;
+  modal.oncancel = null;
+  if (session.opener && session.opener.isConnected) session.opener.focus();
+}
+
+function openNoteEditor(it, note, overrides = {}) {
+  closeNoteEditor();
+  const modal = $('#note-modal');
+  const textarea = $('#note-text');
+  const preview = $('#note-preview');
+  const status = $('#note-status');
+  const save = $('#note-save');
+  const del = $('#note-delete');
+  const timer = { id: null };
+  const session = {
+    modal, textarea, timer,
+    revision: overrides.revision || note.revision,
+    opener: document.activeElement,
+  };
+  activeNoteEditor = session;
+  $('#note-modal-title').textContent = `论文笔记 · ${it.slug}`;
+  $('#note-modal-meta').textContent = `${it.topic}/${it.year}/${it.slug}/note.md`;
+  textarea.value = typeof overrides.text === 'string' ? overrides.text : note.text;
+  textarea.maxLength = 200000;
+  status.textContent = '';
+  save.disabled = false;
+  del.disabled = false;
+  del.classList.toggle('hidden', !note.hasNote);
+  $('#note-form').onsubmit = event => {
+    event.preventDefault();
+    submitNote();
+  };
+  const refresh = () => { preview.innerHTML = notePreviewHtml(textarea.value); };
+
+  async function saveNote() {
+    const text = textarea.value;
+    save.disabled = true;
+    del.disabled = true;
+    textarea.readOnly = true;
+    status.textContent = '保存中…';
+    try {
+      const data = await api('/api/paper/note', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ topic: it.topic, year: it.year, slug: it.slug, text, revision: session.revision }),
+      });
+      Object.assign(note, {
+        text: data.text || '',
+        revision: data.revision || 'missing',
+        hasNote: !!data.has_note,
+        source: 'remote',
+        byteSize: data.byte_size || 0,
+        recovery: '',
+        remoteError: '',
+      });
+      session.revision = note.revision;
+      closeNoteEditor();
+      note.afterSave?.();
+    } catch (e) {
+      if (e.status === 409) {
+        status.textContent = e.message + ' 正在获取最新版本号…';
+        try {
+          const latest = await api(noteQuery(it), { cache: 'no-store' });
+          session.revision = latest.revision || 'missing';
+          status.textContent = '远端已有新版本，已取到最新版本号；确认内容后再点保存会覆盖它。';
+        } catch (err) {
+          status.textContent = '无法获取最新版本：' + err.message;
+        }
+      } else {
+        status.textContent = e.message;
+      }
+      save.disabled = false;
+      del.disabled = false;
+      textarea.readOnly = false;
+    }
+  }
+
+  async function submitNote() {
+    if (!textarea.value.trim() && (note.hasNote || session.revision !== 'missing')) {
+      const ok = await confirmDialog({
+        title: '清空笔记',
+        text: '内容为空，保存会删除远端 note.md（并同步删除本机镜像）。',
+        confirmLabel: '清空并删除',
+      });
+      if (!ok) return;
+    }
+    await saveNote();
+  }
+
+  del.onclick = async () => {
+    const ok = await confirmDialog({
+      title: `删除 ${it.slug} 的笔记`,
+      text: '远端论文目录下的 note.md 会被删除，本机镜像同步删除；论文本身不受影响。',
+      confirmLabel: '删除笔记',
+    });
+    if (!ok) return;
+    textarea.value = '';
+    await saveNote();
+  };
+  $('#note-cancel').onclick = closeNoteEditor;
+  $('#note-modal-close').onclick = closeNoteEditor;
+  modal.onclick = event => { if (event.target === modal) closeNoteEditor(); };
+  modal.oncancel = event => { event.preventDefault(); closeNoteEditor(); };
+  textarea.oninput = () => {
+    status.textContent = '尚未保存';
+    clearTimeout(timer.id);
+    timer.id = setTimeout(refresh, 180);
+  };
+  textarea.onkeydown = event => {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
+      event.preventDefault();
+      if (!save.disabled) submitNote();
+    }
+  };
+  refresh();
+  modal.classList.remove('hidden');
+  document.body.classList.add('preview-open');
+  modal.showModal();
+  textarea.focus();
+  textarea.setSelectionRange(0, 0);
 }
 
 async function copyCitation(text, output) {
@@ -4146,7 +5154,8 @@ const SPLIT_GUTTER = 12;
 const splitState = { width: SPLIT_DEFAULT };
 
 function splitterMax() {
-  const layout = $('#library-layout');
+  // 隐藏的标签页 clientWidth 为 0，只能量当前可见的那个工作区
+  const layout = $$('.layout').find(el => el.clientWidth > 0) || $('#library-layout');
   const width = layout && layout.clientWidth > 0 ? layout.clientWidth : window.innerWidth - 64;
   return Math.max(SPLIT_MIN,
     Math.min(SPLIT_LIMIT, Math.round(width - SPLIT_GUTTER - SPLIT_DETAIL_MIN)));
@@ -4155,61 +5164,626 @@ function splitterMax() {
 function applyListWidth(px, save = false) {
   splitState.width = Math.min(splitterMax(), Math.max(SPLIT_MIN, Math.round(px)));
   document.documentElement.style.setProperty('--list-width', splitState.width + 'px');
-  const bar = $('#list-splitter');
-  if (bar) {
+  $$('.splitter').forEach(bar => {
     bar.setAttribute('aria-valuenow', splitState.width);
     bar.setAttribute('aria-valuemin', SPLIT_MIN);
     bar.setAttribute('aria-valuemax', splitterMax());
-  }
+  });
   if (save) {
     try { localStorage.setItem(SPLIT_KEY, String(splitState.width)); } catch {}
   }
 }
 
 function initSplitter() {
-  const bar = $('#list-splitter');
-  const layout = $('#library-layout');
-  if (!bar || !layout) return;
+  const bars = $$('.splitter');
+  if (!bars.length) return;
   let saved = SPLIT_DEFAULT;
   try { saved = Number(localStorage.getItem(SPLIT_KEY)) || SPLIT_DEFAULT; } catch {}
   applyListWidth(saved);
 
-  let dragLeft = 0;
-  const onMove = event => applyListWidth(event.clientX - dragLeft);
-  const stop = () => {
-    bar.classList.remove('dragging');
-    document.body.classList.remove('col-resizing');
-    window.removeEventListener('pointermove', onMove);
-    window.removeEventListener('pointerup', stop);
-    window.removeEventListener('pointercancel', stop);
-    applyListWidth(splitState.width, true);
-  };
-  bar.addEventListener('pointerdown', event => {
-    if (event.button !== 0) return;
-    event.preventDefault();
-    dragLeft = layout.getBoundingClientRect().left;
-    bar.classList.add('dragging');
-    document.body.classList.add('col-resizing');
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', stop);
-    window.addEventListener('pointercancel', stop);
-    bar.focus();
+  bars.forEach(bar => {
+    const layout = bar.parentElement;
+    let dragLeft = 0;
+    const onMove = event => applyListWidth(event.clientX - dragLeft);
+    const stop = () => {
+      bar.classList.remove('dragging');
+      document.body.classList.remove('col-resizing');
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', stop);
+      window.removeEventListener('pointercancel', stop);
+      applyListWidth(splitState.width, true);
+    };
+    bar.addEventListener('pointerdown', event => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      dragLeft = layout.getBoundingClientRect().left;
+      bar.classList.add('dragging');
+      document.body.classList.add('col-resizing');
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', stop);
+      window.addEventListener('pointercancel', stop);
+      bar.focus();
+    });
+    bar.addEventListener('dblclick', () => applyListWidth(SPLIT_DEFAULT, true));
+    bar.addEventListener('keydown', event => {
+      const step = event.shiftKey ? 64 : 16;
+      if (event.key === 'ArrowLeft') applyListWidth(splitState.width - step, true);
+      else if (event.key === 'ArrowRight') applyListWidth(splitState.width + step, true);
+      else if (event.key === 'Home') applyListWidth(SPLIT_MIN, true);
+      else if (event.key === 'End') applyListWidth(splitterMax(), true);
+      else return;
+      event.preventDefault();
+    });
   });
-  bar.addEventListener('dblclick', () => applyListWidth(SPLIT_DEFAULT, true));
-  bar.addEventListener('keydown', event => {
-    const step = event.shiftKey ? 64 : 16;
-    if (event.key === 'ArrowLeft') applyListWidth(splitState.width - step, true);
-    else if (event.key === 'ArrowRight') applyListWidth(splitState.width + step, true);
-    else if (event.key === 'Home') applyListWidth(SPLIT_MIN, true);
-    else if (event.key === 'End') applyListWidth(splitterMax(), true);
-    else return;
-    event.preventDefault();
-  });
-  window.addEventListener('resize', () => {
-    if (!layout.clientWidth) return;
-    applyListWidth(splitState.width);
+  window.addEventListener('resize', () => applyListWidth(splitState.width));
+}
+
+/* ---------- 审稿空间 ---------- */
+
+const reviewState = {
+  items: [], root: '', templates: [], statuses: [], loaded: false,
+  key: '', task: null, files: [], revision: '', detailLoaded: false,
+  timer: 0, pending: null, conflict: false, savedAt: '', dirtyBody: false,
+  trash: [], trashLoaded: false,
+};
+
+function reviewManuscriptUrl(key, name) {
+  return '/api/review/pdf?key=' + encodeURIComponent(key) +
+    '&name=' + encodeURIComponent(name) +
+    '&token=' + encodeURIComponent(state.pdfToken || '');
+}
+
+function reviewDeadlineText(item) {
+  if (!item.due) return '未设截止日期';
+  if (typeof item.days_left !== 'number') return '截止 ' + item.due;
+  if (item.overdue) return `已逾期 ${Math.abs(item.days_left)} 天`;
+  if (item.days_left === 0) return `今天 ${item.due} 截止`;
+  return `剩 ${item.days_left} 天 · ${item.due}`;
+}
+
+function reviewRowHtml(item) {
+  const badges = [
+    `<span class="badge pdf">${esc(item.status_label)}</span>`,
+    item.has_manuscript ? '' : '<span class="badge warn">无稿件</span>',
+  ].join('');
+  const sub = [item.title || '未填稿件标题', reviewDeadlineText(item)].join(' · ');
+  return `<button type="button" class="review-row${item.key === reviewState.key ? ' active' : ''}"
+      data-review-key="${esc(item.key)}">
+    <span class="slug">${esc(item.venue)} / ${esc(item.submission)}</span>
+    <span class="muted">${esc(sub)}</span>
+    <span class="badges">${badges}</span>
+  </button>`;
+}
+
+function renderReviewList() {
+  const list = $('#review-list');
+  if (!reviewState.loaded) {
+    renderViewState(list, 'loading', '正在读取审稿任务');
+    return;
+  }
+  if (!reviewState.items.length) {
+    renderViewState(list, 'empty', '还没有审稿任务',
+      '点「新建任务」按「会议 / 投稿号」建一个目录，稿件与评审文本都只写在本机。');
+    return;
+  }
+  list.innerHTML = reviewState.items.map(reviewRowHtml).join('');
+  list.querySelectorAll('[data-review-key]').forEach(btn => {
+    btn.onclick = () => selectReview(btn.dataset.reviewKey);
   });
 }
+
+function reviewFieldHtml(id, label, value, kind) {
+  if (kind === 'status') {
+    const options = reviewState.statuses.map(s =>
+      `<option value="${esc(s.value)}"${s.value === value ? ' selected' : ''}>${esc(s.label)}</option>`).join('');
+    return `<label>${esc(label)}<select id="${id}">${options}</select></label>`;
+  }
+  return `<label>${esc(label)}<input id="${id}" value="${esc(value)}"${kind === 'date'
+    ? ' type="date"' : ''} autocomplete="off"></label>`;
+}
+
+function reviewFileRowHtml(file) {
+  const isPdf = /\.pdf$/i.test(file.name);
+  return `<div class="review-file">
+    <span class="badge ${isPdf ? 'tex' : 'code'}">${isPdf ? 'PDF' : '文件'}</span>
+    <span class="slug">${esc(file.name)}</span>
+    <span class="muted">${byteText(file.size)}</span>
+    ${isPdf ? `<button type="button" class="mini ghost" data-review-open="${esc(file.name)}">打开</button>` : ''}
+  </div>`;
+}
+
+function reviewDetailHtml(data) {
+  const task = data.task;
+  const files = data.files || [];
+  const fileRows = files.length
+    ? files.map(reviewFileRowHtml).join('')
+    : '<p class="muted">还没有稿件文件。稿件只写在本机任务目录，不进论文库。</p>';
+  return `<div class="pad review-detail">
+    <div class="review-task-head">
+      <span class="slug">${esc(task.venue)} / ${esc(task.submission)}</span>
+      <span class="muted">${esc(reviewDeadlineText(task))}${task.purged_at ? ' · 稿件已清除' : ''}</span>
+    </div>
+    <div class="review-meta form">
+      ${reviewFieldHtml('rvf-title', '稿件标题', task.title, 'text')}
+      ${reviewFieldHtml('rvf-venue_label', '会议全称', task.venue_label, 'text')}
+      <div class="row">
+        ${reviewFieldHtml('rvf-round', '轮次', task.round, 'text')}
+        ${reviewFieldHtml('rvf-due', '截止日期', task.due, 'date')}
+        ${reviewFieldHtml('rvf-status', '状态', task.status, 'status')}
+      </div>
+      <div class="row">
+        ${reviewFieldHtml('rvf-rating', '评分', task.rating, 'text')}
+        ${reviewFieldHtml('rvf-confidence', '置信度', task.confidence, 'text')}
+      </div>
+      <label>备注<textarea id="rvf-note" rows="2">${esc(task.note)}</textarea></label>
+    </div>
+    <div class="toolbar inner review-actions">
+      <button type="button" id="rv-upload" class="mini">${files.length ? '替换稿件' : '上传稿件'}</button>
+      <button type="button" id="rv-open" class="mini ghost" ${files.length ? '' : 'disabled'}>打开稿件</button>
+      <button type="button" id="rv-purge" class="mini ghost" ${files.length ? '' : 'disabled'}>清除稿件</button>
+      <button type="button" id="rv-export" class="mini ghost">导出可粘贴文本</button>
+      <button type="button" id="rv-reload" class="mini ghost">重新载入</button>
+      <button type="button" id="rv-delete" class="mini ghost danger">删除任务</button>
+      <span id="rv-save" class="muted"></span>
+    </div>
+    <div class="review-files">${fileRows}</div>
+    <div class="review-editor-head">
+      <span class="muted">评审文本 · 本机 review.md</span>
+      <div class="seg" id="rv-view-seg" aria-label="评审文本视图">
+        <button type="button" data-view="edit" class="active" aria-pressed="true">编辑</button>
+        <button type="button" data-view="preview" aria-pressed="false">预览</button>
+      </div>
+    </div>
+    <textarea id="rv-editor" class="review-editor" spellcheck="false"
+      aria-label="评审文本，保存在本机 review.md">${esc(data.review)}</textarea>
+    <div id="rv-preview" class="markdown-body review-preview hidden" tabindex="0"></div>
+  </div>`;
+}
+
+function reviewFieldsPayload() {
+  const read = id => {
+    const el = document.getElementById(id);
+    return el ? el.value.trim() : '';
+  };
+  return {
+    title: read('rvf-title'), venue_label: read('rvf-venue_label'),
+    round: read('rvf-round'), due: read('rvf-due'), status: read('rvf-status'),
+    rating: read('rvf-rating'), confidence: read('rvf-confidence'), note: read('rvf-note'),
+  };
+}
+
+function reviewSaveText() {
+  reviewState.savedAt = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  $('#rv-save').textContent = `已保存 ${reviewState.savedAt}`;
+}
+
+async function saveReviewBody() {
+  const editor = $('#rv-editor');
+  const target = $('#rv-save');
+  if (!editor || !target || reviewState.conflict) return;
+  const body = editor.value;
+  reviewState.dirtyBody = false;
+  if (body === reviewState.review) return;
+  target.textContent = '正在保存…';
+  const request = api('/api/review/task', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key: reviewState.key, review: body, expected: reviewState.revision }),
+  }).then(result => {
+    reviewState.revision = result.revision;
+    reviewState.review = body;
+    reviewState.conflict = false;
+    if (document.activeElement !== editor) reviewSaveText();
+    else setTimeout(reviewSaveText, 0);
+    return result;
+  }).catch(error => {
+    if (error.status === 409) {
+      reviewState.conflict = true;
+      target.textContent = '保存冲突';
+      toast('服务端评审文本已变化，自动保存已暂停。请先复制本地内容，再点「重新载入」。', 'warn');
+    } else {
+      reviewState.dirtyBody = true;
+      target.textContent = '保存失败';
+      toast('评审文本保存失败：' + error.message, 'error');
+    }
+    return null;
+  });
+  reviewState.pending = request;
+  return request;
+}
+
+async function saveReviewFields() {
+  const target = $('#rv-save');
+  if (!target || reviewState.conflict) return;
+  clearTimeout(reviewState.timer);
+  if (reviewState.dirtyBody) await saveReviewBody();
+  else if (reviewState.pending) await reviewState.pending;
+  target.textContent = '正在保存…';
+  try {
+    const result = await api('/api/review/task', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: reviewState.key, fields: reviewFieldsPayload() }),
+    });
+    reviewState.task = result.task;
+    reviewState.revision = result.revision;
+    reviewSaveText();
+    await loadReviewList();
+  } catch (e) {
+    target.textContent = '保存失败';
+    toast('审稿信息保存失败：' + e.message, 'error');
+  }
+}
+
+function queueReviewSave() {
+  clearTimeout(reviewState.timer);
+  reviewState.dirtyBody = true;
+  const target = $('#rv-save');
+  if (target) target.textContent = '有改动待保存…';
+  reviewState.timer = setTimeout(() => { saveReviewBody(); }, 1200);
+}
+
+function bindReviewDetail() {
+  const editor = $('#rv-editor');
+  if (editor) {
+    editor.addEventListener('input', queueReviewSave);
+    editor.addEventListener('blur', () => { clearTimeout(reviewState.timer); saveReviewBody(); });
+  }
+  $$('#rv-view-seg button').forEach(btn => {
+    btn.onclick = () => setReviewView(btn.dataset.view);
+  });
+  ['rvf-title', 'rvf-venue_label', 'rvf-round', 'rvf-due', 'rvf-status',
+   'rvf-rating', 'rvf-confidence', 'rvf-note'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('change', () => { clearTimeout(reviewState.timer); saveReviewFields(); });
+  });
+  $('#rv-upload').onclick = () => $('#review-pdf-input').click();
+  $('#rv-open').onclick = () => openReviewPdf(reviewState.files[0]?.name);
+  $('#rv-reload').onclick = () => selectReview(reviewState.key, true);
+  $('#rv-export').onclick = () => openReviewExport();
+  $('#rv-purge').onclick = purgeReviewManuscript;
+  $('#rv-delete').onclick = deleteReviewTask;
+  $$('#review-detail [data-review-open]').forEach(btn => {
+    btn.onclick = () => openReviewPdf(btn.dataset.reviewOpen);
+  });
+}
+
+async function setReviewView(view) {
+  const editor = $('#rv-editor');
+  const preview = $('#rv-preview');
+  if (!editor || !preview) return;
+  const target = view === 'preview' ? 'preview' : 'edit';
+  if (target === 'preview' && reviewState.dirtyBody) await saveReviewBody();
+  if (target === 'preview') {
+    preview.innerHTML = PapertexMarkdown.render(editor.value, {
+      emptyText: '评审文本为空。切换回编辑模式开始撰写。',
+    });
+  }
+  editor.classList.toggle('hidden', target === 'preview');
+  preview.classList.toggle('hidden', target !== 'preview');
+  $$('#rv-view-seg button').forEach(btn => {
+    const active = btn.dataset.view === target;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+  if (target === 'preview') preview.focus();
+  else editor.focus();
+}
+
+async function openReviewPdf(name) {  const target = name || (reviewState.files[0] || {}).name;
+  if (!target) return;
+  await openPdfTab(() => reviewManuscriptUrl(reviewState.key, target), reviewState.key);
+}
+
+async function selectReview(key, force) {
+  if (!key) return;
+  clearTimeout(reviewState.timer);
+  if (reviewState.pending) await reviewState.pending;
+  if (reviewState.dirtyBody) await saveReviewBody();
+  if (!force && key === reviewState.key && reviewState.detailLoaded) return;
+  reviewState.key = key;
+  renderReviewList();
+  $('#review-current').textContent = key;
+  const host = $('#review-detail');
+  renderViewState(host, 'loading', '正在读取任务');
+  try {
+    const data = await api('/api/review/task?key=' + encodeURIComponent(key));
+    reviewState.task = data.task;
+    reviewState.review = data.review;
+    reviewState.revision = data.revision;
+    reviewState.files = data.files || [];
+    reviewState.detailLoaded = true;
+    reviewState.conflict = false;
+    reviewState.dirtyBody = false;
+    host.innerHTML = reviewDetailHtml(data);
+    bindReviewDetail();
+    reviewSaveText();
+  } catch (e) {
+    renderViewState(host, 'error', '读取失败', e.message, () => selectReview(key, true));
+  }
+}
+
+function reviewExportText(task, body) {
+  const head = [`# ${task.venue} / ${task.submission}`];
+  if (task.title) head.push('稿件：' + task.title);
+  if (task.round) head.push('轮次：' + task.round);
+  if (task.due) head.push('截止：' + task.due);
+  const scores = [];
+  if (task.rating) scores.push('评分：' + task.rating);
+  if (task.confidence) scores.push('置信度：' + task.confidence);
+  if (scores.length) head.push(scores.join(' / '));
+  return [head.join('\n'), (body || '').trim()].filter(Boolean).join('\n\n') + '\n';
+}
+
+function openReviewExport() {
+  const editor = $('#rv-editor');
+  const text = reviewExportText(reviewState.task || {}, editor ? editor.value : reviewState.review);
+  $('#review-export-text').value = text;
+  $('#review-export-status').textContent = '';
+  const modal = $('#review-export-modal');
+  modal.classList.remove('hidden');
+  document.body.classList.add('preview-open');
+  modal.showModal();
+  $('#review-export-text').select();
+}
+
+async function copyReviewExport() {
+  const area = $('#review-export-text');
+  const status = $('#review-export-status');
+  try {
+    await navigator.clipboard.writeText(area.value);
+    status.textContent = '已复制到剪贴板';
+  } catch {
+    area.select();
+    status.textContent = '内容已全选，请按 ⌘C 手动复制';
+  }
+}
+
+function downloadReviewExport() {
+  const name = String(reviewState.key || 'review').replace(/[^\w.-]+/g, '_') + '.md';
+  const url = URL.createObjectURL(new Blob([$('#review-export-text').value],
+    { type: 'text/markdown;charset=utf-8' }));
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = name;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  $('#review-export-status').textContent = '已下载 ' + name;
+}
+
+async function uploadReviewManuscript(event) {
+  const file = event.target.files && event.target.files[0];
+  event.target.value = '';
+  if (!file || !reviewState.key) return;
+  const target = $('#rv-save');
+  if (target) target.textContent = '正在上传稿件…';
+  const form = new FormData();
+  form.append('key', reviewState.key);
+  form.append('overwrite', reviewState.files.some(f => f.name === 'manuscript.pdf') ? 'true' : 'false');
+  form.append('pdf', file);
+  try {
+    const result = await api('/api/review/manuscript', { method: 'POST', body: form });
+    toast('稿件已写入本机：' + (result.file ? result.file.name : ''), 'ok');
+    await selectReview(reviewState.key, true);
+    await loadReviewList();
+  } catch (e) {
+    if (target) target.textContent = '上传失败';
+    toast('稿件上传失败：' + e.message, 'error');
+  }
+}
+
+async function purgeReviewManuscript() {
+  const ok = await confirmDialog({
+    title: '清除稿件',
+    text: '会删除本任务的 manuscript.pdf 与 supplement/ 目录，评审文本与审稿信息保留。'
+      + '部分会议要求审稿结束后销毁稿件。',
+    confirmLabel: '清除稿件',
+    expected: '清除稿件',
+    inputLabel: '输入「清除稿件」以确认',
+  });
+  if (!ok) return;
+  try {
+    const result = await api('/api/review/purge', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: reviewState.key, confirm: '清除稿件' }),
+    });
+    toast(result.notice || '稿件已清除', 'ok');
+    await selectReview(reviewState.key, true);
+    await loadReviewList();
+  } catch (e) {
+    toast('清除稿件失败：' + e.message, 'error');
+  }
+}
+
+async function deleteReviewTask() {
+  const ok = await confirmDialog({
+    title: '删除审稿任务',
+    text: `会把 ${reviewState.key} 整目录移入本机审稿回收区，可随时恢复；彻底删除需在回收区再确认一次。`,
+    confirmLabel: '移入回收区',
+    expected: '删除',
+    inputLabel: '输入「删除」以确认',
+  });
+  if (!ok) return;
+  try {
+    const result = await api('/api/review?key=' + encodeURIComponent(reviewState.key) +
+      '&confirm=' + encodeURIComponent('删除'), { method: 'DELETE' });
+    toast(result.notice || '任务已移入回收区', 'ok');
+    reviewState.key = '';
+    reviewState.detailLoaded = false;
+    $('#review-current').textContent = '';
+    $('#review-detail').innerHTML = '<p class="muted pad">先在左侧新建或选择审稿任务</p>';
+    await loadReviewList();
+  } catch (e) {
+    toast('删除失败：' + e.message, 'error');
+  }
+}
+
+function reviewTrashRowHtml(item) {
+  const files = (item.files || []).map(f => f.name).join('、');
+  return `<div class="panel-row">
+    <span class="badge tex">回收</span>
+    <div class="main">
+      <div class="slug">${esc(item.venue)} / ${esc(item.submission)}</div>
+      <div class="muted">${esc(item.title || '未填稿件标题')}${files ? ' · ' + esc(files) : ''}</div>
+    </div>
+    <button type="button" class="mini" data-trash-restore="${esc(item.trash_id)}">恢复</button>
+    <button type="button" class="mini danger" data-trash-purge="${esc(item.trash_id)}">彻底删除</button>
+  </div>`;
+}
+
+async function loadReviewTrash() {
+  const list = $('#review-trash-list');
+  $('#review-trash-result').textContent = '正在读取…';
+  try {
+    const data = await api('/api/review/trash');
+    reviewState.trash = data.items || [];
+    reviewState.trashLoaded = true;
+    $('#review-trash-result').textContent = `${reviewState.trash.length} 个任务`;
+    list.innerHTML = reviewState.trash.length
+      ? reviewState.trash.map(reviewTrashRowHtml).join('')
+      : '<p class="muted pad">回收区是空的。</p>';
+    list.querySelectorAll('[data-trash-restore]').forEach(btn => {
+      btn.onclick = () => restoreReviewTask(btn.dataset.trashRestore);
+    });
+    list.querySelectorAll('[data-trash-purge]').forEach(btn => {
+      btn.onclick = () => purgeReviewTask(btn.dataset.trashPurge);
+    });
+  } catch (e) {
+    $('#review-trash-result').textContent = '读取失败';
+    toast('回收区读取失败：' + e.message, 'error');
+  }
+}
+
+async function restoreReviewTask(trashId) {
+  try {
+    const result = await api('/api/review/trash/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ trash_id: trashId }),
+    });
+    toast(result.notice || '任务已恢复', 'ok');
+    await loadReviewTrash();
+    await loadReviewList();
+  } catch (e) {
+    toast('恢复失败：' + e.message, 'error');
+  }
+}
+
+async function purgeReviewTask(trashId) {
+  const ok = await confirmDialog({
+    title: '彻底删除审稿任务',
+    text: '稿件与评审文本会从本机审稿目录永久删除，不可恢复。',
+    confirmLabel: '彻底删除',
+    expected: '清理',
+    inputLabel: '输入「清理」以确认',
+  });
+  if (!ok) return;
+  try {
+    const result = await api('/api/review/trash?trash_id=' + encodeURIComponent(trashId) +
+      '&confirm=' + encodeURIComponent('清理'), { method: 'DELETE' });
+    toast(result.notice || '已彻底删除', 'ok');
+    await loadReviewTrash();
+    await loadReviewList();
+  } catch (e) {
+    toast('彻底删除失败：' + e.message, 'error');
+  }
+}
+
+function openReviewTrash() {
+  const modal = $('#review-trash-modal');
+  modal.classList.remove('hidden');
+  document.body.classList.add('preview-open');
+  modal.showModal();
+  loadReviewTrash();
+}
+
+function openReviewCreate() {
+  $('#review-create-status').textContent = '';
+  ['review-venue', 'review-submission', 'review-title', 'review-venue-label', 'review-round',
+   'review-due'].forEach(id => { document.getElementById(id).value = ''; });
+  $('#review-status-select').innerHTML = reviewState.statuses.map(s =>
+    `<option value="${esc(s.value)}">${esc(s.label)}</option>`).join('');
+  $('#review-template-select').innerHTML = reviewState.templates.map(t =>
+    `<option value="${esc(t.name)}">${esc(t.name)}</option>`).join('');
+  const modal = $('#review-create-modal');
+  modal.classList.remove('hidden');
+  document.body.classList.add('preview-open');
+  modal.showModal();
+  $('#review-venue').focus();
+}
+
+async function createReviewTask(event) {
+  event.preventDefault();
+  const button = event.target.querySelector('button[type="submit"]');
+  button.disabled = true;
+  $('#review-create-status').textContent = '正在创建…';
+  try {
+    const result = await api('/api/review', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        venue: $('#review-venue').value.trim(),
+        submission: $('#review-submission').value.trim(),
+        title: $('#review-title').value.trim(),
+        venue_label: $('#review-venue-label').value.trim(),
+        round: $('#review-round').value.trim(),
+        due: $('#review-due').value,
+        status: $('#review-status-select').value,
+        template: $('#review-template-select').value,
+      }),
+    });
+    const modal = $('#review-create-modal');
+    modal.close();
+    modal.classList.add('hidden');
+    document.body.classList.remove('preview-open');
+    toast(result.notice || '任务已创建', 'ok');
+    await loadReviewList();
+    await selectReview(result.task.key, true);
+  } catch (e) {
+    $('#review-create-status').textContent = '创建失败：' + e.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function loadReviewList() {
+  try {
+    const data = await api('/api/review');
+    const keepKey = reviewState.key;
+    reviewState.items = data.items || [];
+    reviewState.root = data.root || '';
+    reviewState.templates = data.templates || [];
+    reviewState.statuses = data.statuses || [];
+    reviewState.loaded = true;
+    $('#review-root-text').textContent = `本机目录 ${reviewState.root} · ${reviewState.items.length} 个任务`;
+    $('#review-trash-btn').textContent = data.trash_count ? `回收区 ${data.trash_count}` : '回收区';
+    renderReviewList();
+    if (keepKey && !reviewState.items.some(i => i.key === keepKey)) {
+      reviewState.key = '';
+      reviewState.detailLoaded = false;
+      $('#review-current').textContent = '';
+      $('#review-detail').innerHTML = '<p class="muted pad">任务已不在列表中，请重新选择。</p>';
+    }
+  } catch (e) {
+    reviewState.loaded = true;
+    renderViewState($('#review-list'), 'error', '审稿任务读取失败', e.message, loadReviewList);
+  }
+}
+
+function initReview() {
+  if (!reviewState.loaded) loadReviewList();
+}
+
+function closeReviewModal(modal) {
+  if (modal.open) modal.close();
+  modal.classList.add('hidden');
+  document.body.classList.remove('preview-open');
+}
+
+/* ---------- 审稿空间结束 ---------- */
 
 $('#settings-open').onclick = openSettings;
 $('#setup-banner-open').onclick = openSettings;
@@ -4222,6 +5796,24 @@ $('#settings-modal').addEventListener('cancel', () => {
   document.body.classList.remove('preview-open');
 });
 
+$('#review-new').onclick = openReviewCreate;
+$('#review-trash-btn').onclick = openReviewTrash;
+$('#review-refresh').onclick = async () => {
+  await loadReviewList();
+  if (reviewState.key) await selectReview(reviewState.key, true);
+};
+$('#review-create-form').onsubmit = createReviewTask;
+$('#review-create-close').onclick = () => closeReviewModal($('#review-create-modal'));
+$('#review-trash-close').onclick = () => closeReviewModal($('#review-trash-modal'));
+$('#review-export-close').onclick = () => closeReviewModal($('#review-export-modal'));
+$('#review-export-copy').onclick = copyReviewExport;
+$('#review-export-download').onclick = downloadReviewExport;
+$('#review-pdf-input').onchange = uploadReviewManuscript;
+['review-create-modal', 'review-trash-modal', 'review-export-modal'].forEach(id => {
+  const modal = document.getElementById(id);
+  modal.addEventListener('cancel', () => closeReviewModal(modal));
+});
+
 renderProjectTypes();
 loadStatus();
 initSplitter();
@@ -4231,7 +5823,7 @@ loadPdfToken().finally(() => {
   loadLibrary();
   loadOptions();
 });
-if (['library', 'upload', 'refs'].includes(location.hash.slice(1))) {
+if (['library', 'upload', 'refs', 'review'].includes(location.hash.slice(1))) {
   const hash = location.hash.slice(1);
   const selector = hash === 'library'
     ? `.tabs button[data-tab="library"][data-mode="${state.libraryMode}"]`

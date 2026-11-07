@@ -87,6 +87,8 @@ function listItemFixture() {
       current: null, items: [], stars: new Set(), research: {}, researchRevision: '', researchError: '',
       readingFilter: '', texFilter: '', search: '', topicFilter: '', yearFilter: '', venueFilter: '',
       onlyStarred: false, onlyGaps: false, remoteError: '',
+      libraryMode: 'paper', tagFilter: new Set(),
+      knowledge: [],
       remoteName: 'research-server',
     },
   });
@@ -283,6 +285,24 @@ test('knowledge rows escape titles and drop the redundant kind badge', () => {
   assert.match(html, /blog/);
 });
 
+test('knowledge local edit banner offers push and pull for conflicts', () => {
+  const c = vm.createContext({ esc: text => String(text ?? '') });
+  vm.runInContext(source.slice(source.indexOf('function knowledgeDate'),
+    source.indexOf('function knowledgeDetailHtml')), c);
+  assert.equal(c.knowledgeSyncHtml(null), '');
+  const syncing = c.knowledgeSyncHtml({ modified_at: '2026-11-05T10:44:00Z', conflict: false });
+  assert.match(syncing, /本机 note\.md 有未同步的修改/);
+  assert.match(syncing, /正在写回远端/);
+  const conflict = c.knowledgeSyncHtml({ modified_at: '2026-11-05T10:44:00Z', conflict: true });
+  assert.match(conflict, /btn-k-sync-push/);
+  assert.match(conflict, /btn-k-sync-pull/);
+  assert.match(conflict, /class="local-edit conflict"/);
+  const unreadable = c.knowledgeSyncHtml({ conflict: true, reason: '本机 note.md 不是 UTF-8 文本，未自动写回' });
+  assert.match(unreadable, /不是 UTF-8 文本/);
+  assert.doesNotMatch(unreadable, /btn-k-sync-push/);
+  assert.match(unreadable, /btn-k-sync-pull/);
+});
+
 test('project ref rows show a safe code link and hide unsafe schemes', () => {
   const c = vm.createContext({});
   vm.runInContext(source.slice(source.indexOf('const esc ='), source.indexOf('const systemTheme')), c);
@@ -298,17 +318,119 @@ test('project ref rows show a safe code link and hide unsafe schemes', () => {
   assert.doesNotMatch(unsafe, /CODE|javascript:/);
 });
 
+test('paper rows label the note badge Note like the TEX and CODE badges', () => {
+  const c = vm.createContext({ esc: text => String(text ?? ''), remoteLabel: () => 'P6000',
+    state: { remoteError: '' } });
+  vm.runInContext(source.slice(
+    source.indexOf('function compareBadges'), source.indexOf('function itemHtml')), c);
+  const it = { local: { has_pdf: true, has_note: true },
+    remote: { has_pdf: true, has_source: true, has_note: true, code: 'https://github.com/u/r' } };
+  const html = c.compareBadges(it);
+  assert.match(html, /class="badge note" title="已有论文笔记 note\.md">Note</);
+  assert.match(html, /badge tex">TEX/);
+  assert.doesNotMatch(html, /badge note">笔记/);
+  assert.doesNotMatch(c.compareBadges({ local: { has_pdf: false, has_note: false },
+    remote: { has_pdf: false, has_source: false, has_note: false } }), /badge note/);
+});
+
+test('note refs get a collapsible preview and local-open action', () => {
+  const c = vm.createContext({});
+  vm.runInContext(source.slice(source.indexOf('const esc ='), source.indexOf('const systemTheme')), c);
+  const start = source.indexOf('function refRow');
+  vm.runInContext(source.slice(start, source.indexOf('function renderRefs', start)), c);
+  const base = {
+    path: '_knowledge/' + 'a'.repeat(32), entry: 'note.md',
+    current: { kind: 'note', entry: 'note.md', title: '一篇笔记' },
+  };
+  const html = c.refRow(base, 3);
+  assert.match(html, /class="badge note">笔记/);
+  assert.match(html, /data-note-toggle="3" aria-expanded="false" aria-controls="note-panel-3">预览笔记/);
+  assert.match(html, /id="note-panel-3" role="region"/);
+  assert.match(html, /class="markdown-body"/);
+  assert.match(html, /data-open-local="3">用本地软件打开/);
+  assert.match(html, /entry: note\.md/);
+
+  const missing = c.refRow({ ...base, missing: true, current: {} }, 0);
+  assert.doesNotMatch(missing, /data-note-toggle|note-panel|data-open-local/);
+  const link = c.refRow({
+    path: '_knowledge/' + 'b'.repeat(32), url: 'https://example.com',
+    current: { kind: 'link', url: 'https://example.com', title: '链接' },
+  }, 0);
+  assert.doesNotMatch(link, /data-note-toggle|note-panel|data-open-local/);
+});
+
+test('markdown renderer uses the caller empty-state text and escapes it', () => {
+  const markdownSource = fs.readFileSync(path.join(__dirname, '../app/static/markdown.js'), 'utf8');
+  const c = vm.createContext({ window: {} });
+  vm.runInContext(markdownSource, c);
+  const md = c.window.PapertexMarkdown;
+  assert.equal(md.render('', { emptyText: '还没有正文' }), '<p class="muted">还没有正文</p>');
+  assert.equal(md.render('   ', { emptyText: '<b>x</b>' }), '<p class="muted">&lt;b&gt;x&lt;/b&gt;</p>');
+  assert.equal(md.render(''), '<p class="muted">没有正文</p>');
+});
+
+test('note preview toggles inline, keeps the loaded body and collapses without refetching', async () => {
+  const classes = new Set(['note-panel', 'hidden']);
+  const body = { innerHTML: '' };
+  const panel = {
+    dataset: {},
+    classList: {
+      add: name => classes.add(name),
+      remove: name => classes.delete(name),
+      contains: name => classes.has(name),
+    },
+    querySelector: () => body,
+  };
+  const button = {
+    attrs: { 'aria-expanded': 'false' }, textContent: '',
+    getAttribute(name) { return this.attrs[name]; },
+    setAttribute(name, value) { this.attrs[name] = value; },
+  };
+  let calls = 0;
+  const c = vm.createContext({
+    state: { refs: [{ path: '_knowledge/' + 'a'.repeat(32), entry: 'note.md' }] },
+    document: { getElementById: id => (id === 'note-panel-0' ? panel : null) },
+    api: async () => { calls += 1; return { item: { body: '# 标题' } }; },
+    PapertexMarkdown: { render: text => `<h1>${text}</h1>` },
+    renderViewState: () => {},
+    encodeURIComponent,
+  });
+  vm.runInContext(source.slice(source.indexOf('async function loadNotePreview'),
+    source.indexOf('function renderRefs')), c);
+
+  c.toggleNotePreview(0, button);
+  assert.equal(classes.has('hidden'), false);
+  assert.equal(button.textContent, '收起笔记');
+  assert.equal(button.attrs['aria-expanded'], 'true');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(body.innerHTML, '<h1># 标题</h1>');
+  assert.equal(calls, 1);
+
+  c.toggleNotePreview(0, button);
+  assert.equal(classes.has('hidden'), true);
+  assert.equal(button.textContent, '预览笔记');
+  c.toggleNotePreview(0, button);
+  assert.equal(calls, 1);
+  assert.equal(body.innerHTML, '<h1># 标题</h1>');
+});
+
 // Minimal selector stubs: real research helpers run in vm; no HTML parser or network.
 function researchNode() {
   const children = new Map();
+  const classes = new Set();
   return {
     innerHTML: '', textContent: '', value: '', disabled: false, isConnected: true,
+    classList: {
+      add: name => classes.add(name),
+      remove: name => classes.delete(name),
+      contains: name => classes.has(name),
+    },
     elements: { status: { value: '' }, note: { value: '' }, label: { value: '' } },
     querySelector(selector) {
       if (!children.has(selector)) children.set(selector, researchNode());
       return children.get(selector);
     },
-    querySelectorAll() { return []; },
+    querySelectorAll() { return this.matches || []; },
     focus() { this.focused = true; },
     select() { this.selected = true; },
   };
@@ -320,7 +442,7 @@ function researchFixture(api = async () => { throw new Error('unexpected API req
   const notices = [];
   Object.assign(c, {
     api, $: selector => root.querySelector(selector),
-    renderList() {}, showDetail() {},
+    renderList() {}, showDetail() {}, syncSearch() {},
     toast: (message, kind) => notices.push({ message, kind }),
     confirmDialog: async () => true,
     navigator: { clipboard: { writeText: async () => { throw new Error('clipboard denied'); } } },
@@ -427,6 +549,130 @@ test('list and research HTML show reading/version badges and escape untrusted va
   assert.doesNotMatch(c.researchBadge(it.key), /<img|reading-badge/);
 });
 
+test('paper tags filter with OR semantics and extend the search index', () => {
+  const c = listItemFixture();
+  const items = ['moe-ts', 'moe', 'diffusion', 'untagged'].map(researchItem);
+  c.state.items = items;
+  c.state.research[items[0].key] = { tags: ['MoE', '时序'] };
+  c.state.research[items[1].key] = { tags: ['MoE'] };
+  c.state.research[items[2].key] = { tags: '损坏记录' };
+  const titles = () => Array.from(c.filtered(), it => it.local.title);
+  c.state.tagFilter.add('MoE');
+  assert.deepEqual(titles(), ['moe-ts', 'moe']);
+  c.state.tagFilter.add('时序');
+  assert.deepEqual(titles(), ['moe-ts', 'moe'], '命中任一标签即保留');
+  c.state.tagFilter.delete('MoE');
+  assert.deepEqual(titles(), ['moe-ts']);
+  c.state.tagFilter.clear();
+  c.state.tagFilter.add('损坏记录');
+  assert.deepEqual(titles(), [], '非数组的标签记录视作没有标签');
+  c.state.tagFilter.clear();
+  c.state.search = 'moe';
+  assert.deepEqual(titles(), ['moe-ts', 'moe'], '关键词搜索也能命中标签');
+  c.state.search = '';
+  c.state.tagFilter.add('MoE');
+  c.state.researchError = 'research-server 读取失败';
+  assert.deepEqual(titles(), ['moe-ts', 'moe', 'diffusion', 'untagged']);
+});
+
+test('list badges always show tags and highlight filter hits', () => {
+  const c = listItemFixture();
+  const it = researchItem('paper');
+  c.state.research[it.key] = { tags: ['<b>MoE', '时序'] };
+  const tone = tag => c.tagTone(tag);
+  const plain = c.researchBadge(it.key);
+  assert.ok(plain.includes(`badge item-tag ${tone('<b>MoE')}">#&lt;b&gt;MoE`));
+  assert.ok(plain.includes(`badge item-tag ${tone('时序')}">#时序`));
+  assert.doesNotMatch(plain, /tag-hit|<b>/);
+  c.state.tagFilter.add('<b>MoE');
+  const html = c.researchBadge(it.key);
+  assert.ok(html.includes(`${tone('<b>MoE')} tag-hit">#&lt;b&gt;MoE`));
+  assert.ok(html.includes(`${tone('时序')}">#时序`), '未命中的标签照常显示，但不高亮');
+  assert.match(c.itemHtml(it), /research-badges">[\s\S]*#时序/);
+  c.state.researchError = 'offline';
+  assert.equal(c.researchBadge(it.key), '');
+});
+
+test('tag colours are stable per tag text and stay within the palette', () => {
+  const c = listItemFixture();
+  const tones = ['MoE', 'moe', '时序', 'Contrastive', '扩散模型', '"><x>', ''].map(tag => c.tagTone(tag));
+  for (const t of tones) assert.match(t, /^tag-c[0-9]$/);
+  assert.equal(c.tagTone('MoE'), c.tagTone('MoE'));
+  assert.equal(new Set(['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'].map(c.tagTone)).size > 3, true, '不同标签分散到多种颜色');
+});
+test('tag filter bar orders by usage, hides when unusable and toggles on click', () => {
+  const { c, root } = researchFixture();
+  const host = root.querySelector('#tag-filters');
+  host.matches = [{ dataset: { tag: 'MoE' } }, { dataset: { tag: '时序' } }];
+  c.state.research['TS/2026/a'] = { tags: ['MoE', '时序'] };
+  c.state.research['TS/2026/b'] = { tags: ['MoE'] };
+  c.state.research['TS/2026/c'] = { tags: ['<img src=x>'] };
+  c.state.tagFilter.add('已删除的标签');
+  c.renderTagFilters();
+  assert.equal(host.classList.contains('hidden'), false);
+  assert.match(host.innerHTML, /tag-filter-label/);
+  assert.ok(host.innerHTML.indexOf('>MoE <') < host.innerHTML.indexOf('>时序 <'), '用量多的标签在前');
+  assert.match(host.innerHTML,
+    /data-tag="MoE"[\s\S]*?aria-pressed="false"[\s\S]*?>MoE <span class="muted">2<\/span>/);
+  assert.equal(c.state.tagFilter.size, 0, '失效的自动选择要清掉');
+  assert.match(host.innerHTML, /data-tag="&lt;img src=x&gt;"/);
+  assert.doesNotMatch(host.innerHTML, /<img/);
+  host.matches[0].onclick();
+  assert.equal(c.state.tagFilter.has('MoE'), true);
+  host.matches[0].onclick();
+  assert.equal(c.state.tagFilter.has('MoE'), false, '再次点击取消');
+  c.state.libraryMode = 'note';
+  c.renderTagFilters();
+  assert.equal(host.innerHTML, '');
+  assert.equal(host.classList.contains('hidden'), true);
+  c.state.libraryMode = 'paper';
+  c.state.researchError = 'offline';
+  c.renderTagFilters();
+  assert.equal(host.classList.contains('hidden'), true, '读取失败时不展示陈旧标签');
+  c.state.researchError = '';
+  c.state.research = {};
+  c.renderTagFilters();
+  assert.equal(host.classList.contains('hidden'), true, '还没有标签时不占位');
+});
+
+test('tag editor adds typed tags, removes chips and posts the whole list', async () => {
+  const writes = [];
+  const { c } = researchFixture(async (url, options) => {
+    if (!options) return { items: {}, revision: 'v1' };
+    const payload = JSON.parse(options.body);
+    writes.push(payload);
+    return { items: { [payload.key]: { tags: payload.tags } }, revision: 'v2' };
+  });
+  const it = researchItem('a');
+  c.state.items = [it];
+  c.state.research = { [it.key]: { tags: ['MoE'] } };
+  c.state.researchRevision = 'v1';
+  const panel = researchNode();
+  const editor = panel.querySelector('#tag-editor');
+  editor.matches = [{ dataset: { tag: 'MoE' } }];
+  c.bindTagEditor(panel, it);
+  assert.match(editor.innerHTML, /class="tag-chip removable tag-c[0-9]"/);
+  assert.match(editor.innerHTML, /aria-label="移除标签 MoE"/);
+  assert.match(panel.querySelector('#tag-options').innerHTML, /<option value="MoE">/);
+  const input = panel.querySelector('#tag-input');
+  const result = panel.querySelector('#tag-result');
+  input.value = ' 时序， diffusion ';
+  await panel.querySelector('#tag-form').onsubmit(submitEvent());
+  assert.deepEqual(writes[0].tags, ['MoE', '时序', 'diffusion']);
+  assert.equal(writes[0].revision, 'v1');
+  assert.equal(result.textContent, '已保存');
+  assert.equal(input.value, '');
+  assert.equal(input.disabled, false);
+  assert.match(editor.innerHTML, /时序/);
+  await editor.matches[0].onclick();
+  assert.deepEqual(writes[1].tags, ['时序', 'diffusion'], '移除只发剩余标签');
+  assert.equal(writes[1].revision, 'v2');
+  input.value = '  ， ';
+  await panel.querySelector('#tag-form').onsubmit(submitEvent());
+  assert.equal(writes.length, 2, '空标签不发请求');
+  assert.equal(result.textContent, '标签不能为空');
+});
+
 test('research load failure disables editing/filtering without treating stale data as current', async () => {
   const calls = [];
   let offline = true;
@@ -496,6 +742,61 @@ test('409 reloads research and throws without retrying the write or mutating inp
   // A later explicit save is permitted; only automatic retries are forbidden.
   c.api = async () => ({ items: {}, revision: 'v3' });
   await c.saveResearch('/api/reading', input);
+});
+
+test('paper edits retry once after refreshing a stale research revision', async () => {
+  const calls = [];
+  const { c } = researchFixture(async url => {
+    calls.push(url);
+    return { items: {}, revision: 'fresh' };
+  });
+  c.state.researchRevision = 'stale';
+  let attempts = 0;
+  const result = await c.retryAfterResearchRefresh(async () => {
+    attempts += 1;
+    if (attempts === 1) {
+      throw Object.assign(new Error('研究记录已改变或缺少 revision，请刷新后重试（耗时 0分8秒）'), { status: 409 });
+    }
+    return { key: 'TS/2026/paper' };
+  });
+  assert.deepEqual(result, { key: 'TS/2026/paper' });
+  assert.equal(attempts, 2, '刷新后只重试一次');
+  assert.deepEqual(calls, ['/api/research']);
+  assert.equal(c.state.researchRevision, 'fresh', '重试前先缓存最新 revision');
+});
+
+test('paper edits keep other conflicts and failures untouched', async () => {
+  const { c } = researchFixture(async () => {
+    throw new Error('unexpected API request');
+  });
+  let attempts = 0;
+  const rename = async () => {
+    attempts += 1;
+    throw Object.assign(new Error('目标目录已存在（耗时 0分1秒）'), { status: 409 });
+  };
+  await assert.rejects(c.retryAfterResearchRefresh(rename), /目标目录已存在/);
+  assert.equal(attempts, 1, '目录冲突不能重试');
+  let offline = 0;
+  const stale = async () => {
+    offline += 1;
+    throw Object.assign(new Error('研究记录已改变，请刷新后重试'), { status: 409 });
+  };
+  await assert.rejects(c.retryAfterResearchRefresh(stale), /研究记录已改变/);
+  assert.equal(offline, 1);
+});
+
+test('paper edits surface the conflict when research cannot be reloaded', async () => {
+  const { c } = researchFixture(async () => {
+    throw new Error('offline');
+  });
+  let attempts = 0;
+  const run = async () => {
+    attempts += 1;
+    throw Object.assign(new Error('研究记录已改变，请刷新后重试'), { status: 409 });
+  };
+  await assert.rejects(c.retryAfterResearchRefresh(run), /研究记录已改变/);
+  assert.equal(attempts, 1, '刷新失败时不再重试');
+  assert.equal(c.state.researchError, 'offline');
 });
 
 test('reading form retains edits made during a conflicting save and re-enables submit', async () => {
@@ -1065,11 +1366,11 @@ test('project type selection persists and rejects unknown types', () => {
     state: { projectTypes: new Set() },
   });
   vm.runInContext(source.slice(source.indexOf('const PROJECT_TYPES_KEY'), source.indexOf('const state = {')), c);
-  assert.deepEqual([...c.loadProjectTypes()], ['pdf', 'png', 'jpg', 'webp', 'gif']);
+  assert.deepEqual([...c.loadProjectTypes()], ['pdf', 'png', 'jpg', 'webp', 'gif', 'md']);
   saved('not json');
-  assert.deepEqual([...c.loadProjectTypes()], ['pdf', 'png', 'jpg', 'webp', 'gif']);
-  saved(JSON.stringify(['pdf', 'gif', 'tiff']));
-  assert.deepEqual([...c.loadProjectTypes()], ['pdf', 'gif']);
+  assert.deepEqual([...c.loadProjectTypes()], ['pdf', 'png', 'jpg', 'webp', 'gif', 'md']);
+  saved(JSON.stringify(['pdf', 'gif', 'tiff', 'md']));
+  assert.deepEqual([...c.loadProjectTypes()], ['pdf', 'gif', 'md']);
   saved('[]');
   assert.deepEqual([...c.loadProjectTypes()], []);
   c.state.projectTypes = new Set(['png', 'webp']);
@@ -1164,7 +1465,7 @@ test('supplement entries disable while pending and reject a second file explicit
   let writes = 0;
   const c = vm.createContext({
     FormData: class { set() {} },
-    state: { current: item, items: [item] },
+    state: { current: item, items: [item], metaCache: new Map() },
     $: () => ({ textContent: '' }), $$: () => buttons,
     runLongOperation: () => { writes++; return response.promise; },
     loadLibrary: async () => {}, renderList() {}, showDetail() {},
@@ -1180,6 +1481,27 @@ test('supplement entries disable while pending and reject a second file explicit
   response.resolve({ ok: true });
   assert.equal(await first, true);
   assert.ok(buttons.every(b => !b.disabled));
+});
+
+test('paper metadata is cached and a failed read can be retried', async () => {
+  let calls = 0;
+  let fail = true;
+  const c = vm.createContext({
+    state: { metaCache: new Map() },
+    api: async () => {
+      calls++;
+      if (fail) throw new Error('offline');
+      return { title: 'cached' };
+    },
+  });
+  vm.runInContext(source.slice(source.indexOf('const metaRequests'), source.indexOf('async function openEditor')), c);
+  const it = { key: 'TS/2024/paper', topic: 'TS', year: '2024', slug: 'paper' };
+  await assert.rejects(c.paperMeta(it), /offline/);
+  const [first, second] = await Promise.all([(fail = false, c.paperMeta(it)), c.paperMeta(it)]);
+  assert.equal(calls, 2);
+  assert.equal(first, second);
+  assert.equal((await c.paperMeta(it)).title, 'cached');
+  assert.equal(calls, 2);
 });
 
 test('unknown download size does not produce a made-up percentage', () => {
@@ -1414,4 +1736,541 @@ test('pdf viewer page titles the tab and only embeds internal PDF endpoints', ()
   const bad = pdfViewFixture('?title=x&src=' + encodeURIComponent('https://example.com/a.pdf'));
   assert.equal(bad.frame.removed, true);
   assert.deepEqual(bad.appended, ['无效的预览地址']);
+});
+
+const reviewSlice = source.slice(source.indexOf('const reviewState'),
+  source.indexOf('/* ---------- 审稿空间结束 ---------- */'));
+
+function reviewFixture() {
+  const elements = new Map();
+  const element = (name) => {
+    const key = String(name).startsWith('#') ? String(name) : '#' + String(name);
+    if (!elements.has(key)) {
+      const classes = new Set();
+      const children = [];
+      elements.set(key, {
+        value: '', textContent: '', innerHTML: '', disabled: false, open: false,
+        dataset: {}, files: [], children,
+        classList: {
+          add: name2 => classes.add(name2),
+          remove: name2 => classes.delete(name2),
+          toggle: (name2, on) => (on ? classes.add(name2) : classes.delete(name2)),
+          contains: name2 => classes.has(name2),
+        },
+        click() { children.push('click'); },
+        focus() {}, select() { children.push('select'); },
+        addEventListener(type, handler) { children.push(type + ':' + (handler ? 'handler' : 'none')); },
+        querySelector() { return null; },
+        querySelectorAll() { return []; },
+        showModal() { this.open = true; },
+        close() { this.open = false; },
+      });
+    }
+    return elements.get(key);
+  };
+  const calls = [];
+  const stub = { result: { revision: 'rev-2' }, error: null };
+  const c = vm.createContext({
+    state: { pdfToken: 'tok' },
+    $: selector => element(selector),
+    $$: () => [],
+    document: {
+      getElementById: id => element(id),
+      querySelector: selector => element(selector),
+      querySelectorAll: () => [],
+      createElement: () => ({ style: {}, click() {}, remove() {} }),
+      body: { classList: { add() {}, remove() {} }, append() {} },
+      activeElement: null,
+    },
+    esc: value => String(value ?? '').replace(/[&<>"']/g, ch => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[ch])),
+    byteText: bytes => bytes + ' B',
+    renderViewState: () => {},
+    api: async (path, options) => {
+      calls.push({ path, options });
+      if (stub.error) throw stub.error;
+      return stub.result;
+    },
+    toast: () => {},
+    confirmDialog: async () => true,
+    openPdfTab: async () => {},
+    FormData: function FormData() { this.appended = []; this.append = (k, v) => this.appended.push([k, v]); },
+    URL: { createObjectURL: () => 'blob:x', revokeObjectURL: () => {} },
+    Blob: function Blob(parts) { this.parts = parts; },
+    setTimeout, clearTimeout,
+  });
+  vm.runInContext(reviewSlice, c);
+  return { c, element, calls, stub, run: code => vm.runInContext(code, c) };
+}
+
+test('review deadlines distinguish overdue, due today and unset dates', () => {
+  const f = reviewFixture();
+  assert.equal(f.run('reviewDeadlineText({ due: "" })'), '未设截止日期');
+  assert.equal(f.run('reviewDeadlineText({ due: "2026-11-20" })'), '截止 2026-11-20');
+  assert.match(f.run('reviewDeadlineText({ due: "2026-11-01", days_left: -3, overdue: true })'),
+    /已逾期 3 天/);
+  assert.equal(f.run('reviewDeadlineText({ due: "2026-11-03", days_left: 0, overdue: false })'),
+    '今天 2026-11-03 截止');
+  assert.equal(f.run('reviewDeadlineText({ due: "2026-11-20", days_left: 17, overdue: false })'),
+    '剩 17 天 · 2026-11-20');
+});
+
+test('review rows escape stored text and flag the active task', () => {
+  const f = reviewFixture();
+  f.run('reviewState.key = "ICML/1"');
+  const html = f.run(`reviewRowHtml({ key: 'ICML/1', venue: 'ICML', submission: '1',
+    status_label: '撰写中', title: '<img src=x>', due: '2026-12-01', days_left: 5,
+    overdue: false, has_manuscript: false })`);
+  assert.match(html, /class="review-row active"/);
+  assert.match(html, /data-review-key="ICML\/1"/);
+  assert.match(html, /&lt;img src=x&gt;/);
+  assert.doesNotMatch(html, /<img>/);
+  assert.match(html, /badge warn">无稿件/);
+  const other = f.run(`reviewRowHtml({ key: 'ICML/2', venue: 'ICML', submission: '2',
+    status_label: '待读', title: '', due: '', overdue: false, has_manuscript: true })`);
+  assert.doesNotMatch(other, /active/);
+  assert.match(other, /未填稿件标题/);
+});
+
+test('review detail renders escaped metadata form and gates file actions', () => {
+  const f = reviewFixture();
+  f.run('reviewState.statuses = [{ value: "pending", label: "待读" }, { value: "writing", label: "撰写中" }]');
+  const data = {
+    task: { venue: 'ICML', submission: '1', key: 'ICML/1', title: '<b>T</b>', venue_label: '',
+      round: 'R1', due: '2026-12-01', status: 'writing', rating: '4', confidence: '', note: '',
+      days_left: 5, overdue: false, purged_at: '' },
+    review: '正文 <script>', revision: 'rev-1',
+    files: [{ name: 'manuscript.pdf', size: 2048 }, { name: 'supplement/附录.txt', size: 10 }],
+  };
+  f.run('reviewState.revision = "rev-1"');
+  const html = f.run(`reviewDetailHtml(${JSON.stringify(data)})`);
+  assert.match(html, /&lt;b&gt;T&lt;\/b&gt;/);
+  assert.doesNotMatch(html, /<b>T<\/b>/);
+  assert.match(html, /<option value="writing" selected>撰写中<\/option>/);
+  assert.match(html, /id="rv-editor"[^>]*>正文 &lt;script&gt;/);
+  assert.doesNotMatch(html, /<script>/);
+  assert.match(html, /id="rv-view-seg"/);
+  assert.match(html, /id="rv-preview" class="markdown-body review-preview hidden"/);
+  assert.match(html, /替换稿件/);
+  assert.match(html, /data-review-open="manuscript\.pdf"/);
+  assert.doesNotMatch(html, /data-review-open="supplement/);
+  assert.match(html, /2048 B/);
+
+  const empty = f.run(`reviewDetailHtml({ task: ${JSON.stringify(data.task)},
+    review: '', revision: 'rev-1', files: [] })`);
+  assert.match(empty, /上传稿件/);
+  assert.match(empty, /id="rv-open" class="mini ghost" disabled/);
+  assert.match(empty, /id="rv-purge" class="mini ghost" disabled/);
+});
+
+test('review export mirrors the server header block and drops empty fields', () => {
+  const f = reviewFixture();
+  const text = f.run(`reviewExportText({ venue: 'ICML', submission: '7', title: 'P',
+    round: '', due: '2026-12-01', rating: '4', confidence: '' }, '  ## Summary\\n正文  ')`);
+  assert.equal(text, '# ICML / 7\n稿件：P\n截止：2026-12-01\n评分：4\n\n## Summary\n正文\n');
+  assert.equal(f.run(`reviewExportText({ venue: 'a', submission: '1', title: '', round: '',
+    due: '', rating: '', confidence: '' }, '')`), '# a / 1\n');
+});
+
+test('review autosave sends the observed revision and pauses on conflict', async () => {
+  const f = reviewFixture();
+  f.run('reviewState.key = "ICML/1"; reviewState.revision = "rev-1"; reviewState.review = "旧"');
+  f.element('#rv-editor').value = '新评审内容';
+  await f.run('saveReviewBody()');
+  assert.equal(f.calls[0].path, '/api/review/task');
+  const body = JSON.parse(f.calls[0].options.body);
+  assert.equal(body.key, 'ICML/1');
+  assert.equal(body.review, '新评审内容');
+  assert.equal(body.expected, 'rev-1');
+  assert.equal(body.fields, undefined);
+  assert.equal(f.run('reviewState.revision'), 'rev-2');
+  assert.equal(f.run('reviewState.conflict'), false);
+
+  f.element('#rv-editor').value = '再改一次';
+  f.stub.error = { status: 409, message: 'conflict' };
+  await f.run('saveReviewBody()');
+  assert.equal(f.run('reviewState.conflict'), true);
+  assert.equal(f.element('#rv-save').textContent, '保存冲突');
+  const before = f.calls.length;
+  f.element('#rv-editor').value = '不应继续发送';
+  await f.run('saveReviewBody()');
+  assert.equal(f.calls.length, before);
+});
+
+test('review field saves keep the editor content untouched', async () => {
+  const f = reviewFixture();
+  f.run('reviewState.key = "ICML/1"');
+  f.element('#rvf-title').value = '  改后的标题  ';
+  f.element('#rvf-due').value = '2026-12-05';
+  f.element('#rvf-status').value = 'submitted';
+  f.run('reviewState.items = []; reviewState.loaded = true; reviewState.detailLoaded = true');
+  await f.run('saveReviewFields()');
+  const body = JSON.parse(f.calls[0].options.body);
+  assert.equal(f.calls[0].path, '/api/review/task');
+  assert.deepEqual(body, { key: 'ICML/1', fields: {
+    title: '改后的标题', venue_label: '', round: '', due: '2026-12-05', status: 'submitted',
+    rating: '', confidence: '', note: '' } });
+  assert.equal(body.review, undefined);
+});
+
+test('review field changes flush unsaved editor text before saving metadata', async () => {
+  const f = reviewFixture();
+  f.run('reviewState.key = "ICML/1"; reviewState.revision = "rev-1"; reviewState.review = "旧"');
+  f.element('#rv-editor').value = '还没落盘的评审意见';
+  f.run('queueReviewSave()');
+  assert.equal(f.calls.length, 0);
+  f.element('#rvf-due').value = '2026-12-05';
+  f.run('reviewState.items = []; reviewState.loaded = true; reviewState.detailLoaded = true');
+  await f.run('saveReviewFields()');
+  assert.deepEqual(f.calls.map(call => call.path),
+                   ['/api/review/task', '/api/review/task', '/api/review']);
+  const first = JSON.parse(f.calls[0].options.body);
+  assert.equal(first.review, '还没落盘的评审意见');
+  assert.equal(first.expected, 'rev-1');
+  assert.equal(first.fields, undefined);
+  const second = JSON.parse(f.calls[1].options.body);
+  assert.equal(second.review, undefined);
+  assert.deepEqual(second.fields, {
+    title: '', venue_label: '', round: '', due: '2026-12-05', status: '',
+    rating: '', confidence: '', note: '' });
+  assert.equal(f.run('reviewState.dirtyBody'), false);
+
+  f.calls.length = 0;
+  f.run('reviewState.key = "ICML/1"; reviewState.review = "旧内容"; queueReviewSave();');
+  f.element('#rv-editor').value = '切换任务前未保存的意见';
+  await f.run('selectReview("ICML/2")');
+  const flushed = JSON.parse(f.calls[0].options.body);
+  assert.equal(f.calls[0].path, '/api/review/task');
+  assert.equal(flushed.key, 'ICML/1');
+  assert.equal(flushed.review, '切换任务前未保存的意见');
+});
+
+test('review manuscript upload uses the local endpoint and overwrite only when a file exists', async () => {
+  const f = reviewFixture();
+  const input = f.element('#review-pdf-input');
+  input.files = [{ name: 'paper.pdf' }];
+  input.value = 'C:\\fakepath\\paper.pdf';
+  f.c.input = input;
+  f.run("reviewState.key = 'ICML/1'; reviewState.files = []; uploadReviewManuscript({ target: input });");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.calls[0].path, '/api/review/manuscript');
+  const form = f.calls[0].options.body;
+  assert.deepEqual(form.appended[0], ['key', 'ICML/1']);
+  assert.deepEqual(form.appended[1], ['overwrite', 'false']);
+  assert.deepEqual(form.appended[2], ['pdf', input.files[0]]);
+  assert.equal(input.value, '');
+
+  f.calls.length = 0;
+  f.run('reviewState.key = "ICML/1"; reviewState.files = [{ name: "manuscript.pdf", size: 1 }]; uploadReviewManuscript({ target: input });');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(f.calls[0].options.body.appended[1], ['overwrite', 'true']);
+
+  f.calls.length = 0;
+  f.run('reviewState.files = []; uploadReviewManuscript({ target: { files: [], value: "" } });');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.calls.length, 0);
+});
+
+test('review review root path is fenced inside the local review directory', () => {
+  const f = reviewFixture();
+  assert.equal(f.run('reviewManuscriptUrl("ICML/1", "manuscript.pdf")'),
+    '/api/review/pdf?key=ICML%2F1&name=manuscript.pdf&token=tok');
+});
+
+test('review tab, splitter and dialogs are wired in the page shell', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../app/static/index.html'), 'utf8');
+  assert.match(html, /<button data-tab="review">审稿<\/button>/);
+  assert.ok(html.indexOf('id="tab-refs"') < html.indexOf('id="tab-review"'));
+  assert.match(html, /id="review-layout"[^>]*>[\s\S]*?id="review-splitter"/);
+  for (const id of ['review-list', 'review-detail', 'review-new', 'review-trash-btn',
+                    'review-create-modal', 'review-trash-modal', 'review-export-modal',
+                    'review-pdf-input', 'settings-review-space']) {
+    assert.ok(html.includes(`id="${id}"`), id);
+  }
+  assert.match(html, /id="review-pdf-input"[^>]*class="hidden"/);
+});
+
+const splitterSlice = source.slice(
+  source.indexOf('/* ---------- 列表 / 详情分隔条 ---------- */'),
+  source.indexOf('/* ---------- 审稿空间 ---------- */'));
+
+function splitterFixture(widths, innerWidth = 0) {
+  const setVars = [];
+  const attrs = {};
+  const layoutEls = widths.map(clientWidth => ({ clientWidth }));
+  const c = vm.createContext({
+    $: selector => selector === '#library-layout' ? layoutEls[0] : null,
+    $$: selector => selector === '.layout' ? layoutEls : [{
+      setAttribute: (name, value) => { attrs[name] = String(value); },
+      addEventListener() {},
+    }],
+    document: {
+      documentElement: { style: { setProperty: (name, value) => setVars.push([name, value]) } },
+    },
+    window: { innerWidth, addEventListener() {} },
+    localStorage: { getItem: () => null, setItem() {} },
+  });
+  vm.runInContext(splitterSlice, c);
+  return { run: code => vm.runInContext(code, c), setVars, attrs };
+}
+
+test('splitter clamps the list width against the visible workspace', () => {
+  // 审稿页激活时资料库工作区的 clientWidth 为 0，上限只能量当前可见的那个布局
+  const f = splitterFixture([0, 1100]);
+  assert.equal(f.run('splitterMax()'), 808);
+  f.run('applyListWidth(3000)');
+  assert.deepEqual(f.setVars[f.setVars.length - 1], ['--list-width', '808px']);
+  assert.equal(f.attrs['aria-valuemax'], '808');
+  f.run('applyListWidth(100)');
+  assert.deepEqual(f.setVars[f.setVars.length - 1], ['--list-width', '240px']);
+
+  const narrow = splitterFixture([400, 0]);
+  assert.equal(narrow.run('splitterMax()'), 240, 'never below the minimum width');
+
+  const collapsed = splitterFixture([0, 0], 1000);
+  assert.equal(collapsed.run('splitterMax()'), 644, 'falls back to the window width');
+});
+
+test('paper note dialog is present in the page shell and wired into the detail pane', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../app/static/index.html'), 'utf8');
+  for (const id of ['note-modal', 'note-modal-title', 'note-modal-meta', 'note-form', 'note-text',
+                    'note-preview', 'note-status', 'note-save', 'note-delete', 'note-cancel',
+                    'note-modal-close']) {
+    assert.ok(html.includes(`id="${id}"`), id);
+  }
+  assert.match(html, /id="note-text"[^>]*maxlength="200000"/);
+  assert.match(html, /id="note-modal"[^>]*class="modal hidden"/);
+  assert.match(source, /\$\{paperNoteHtml\(it\)\}/);
+  assert.match(source, /\/api\/paper\/note\/open' \+ noteQueryParams\(it\)/);
+  assert.match(source, /openBtn\.disabled = !note\.hasNote/);
+  assert.match(source, /openBtn\.onclick = async/);
+  assert.match(source, /bindPaperNote\(it\);\n\}/);
+});
+
+const noteSlice = source.slice(
+  source.indexOf('function noteQueryParams'),
+  source.indexOf('function closeNoteEditor'));
+
+test('paper note helpers build escaped markup and encode coordinates', () => {
+  const c = vm.createContext({
+    esc: text => String(text ?? '').replace(/[&<>"']/g, ch => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[ch])),
+    PapertexMarkdown: { render: (text, opts) => `<md>${text}</md>` },
+  });
+  vm.runInContext(noteSlice, c);
+  const run = code => vm.runInContext(code, c);
+  assert.equal(
+    run('noteQuery({ topic: "ML", year: "2026", slug: "a b" })'),
+    '/api/paper/note?topic=ML&year=2026&slug=a%20b');
+  assert.equal(
+    run("'/api/paper/note/open' + noteQueryParams({ topic: 'ML', year: '2026', slug: 'a b' })"),
+    '/api/paper/note/open?topic=ML&year=2026&slug=a%20b');
+  const panel = run('paperNoteHtml({ slug: "<x>" })');
+  assert.match(panel, /id="paper-note-panel"/);
+  assert.match(panel, /&lt;x&gt;\/note\.md/);
+  assert.doesNotMatch(panel, /<x>/);
+  assert.match(panel, /id="panel-note-open"/);
+  assert.match(panel, /用本地软件打开/);
+  assert.match(run('notePreviewHtml("")'), /左侧输入 Markdown/);
+  assert.equal(run('notePreviewHtml("# hi")'), '<md># hi</md>');
+});
+
+function selectItem() {
+  return {
+    key: 'TS/2024/x', slug: '2024-TIT-Li-x',
+    local: { has_pdf: true, pdf: 'paper.pdf', title: '', venue: '' },
+    remote: {
+      has_pdf: true, pdf: 'paper.pdf', has_source: false, entry: '',
+      title: 'A study', venue: 'TIT',
+    },
+  };
+}
+
+test('select mode adds a labelled pick box and marks chosen rows', () => {
+  const c = listItemFixture();
+  assert.doesNotMatch(c.itemHtml(selectItem()), /class="pick"/);
+  c.state.selectMode = true;
+  c.state.selected = new Set(['TS/2024/x']);
+  const html = c.itemHtml(selectItem());
+  assert.match(html, /class="item\s+picked"/);
+  assert.match(html, /class="pick" data-pick="TS\/2024\/x" checked aria-label="选择 2024-TIT-Li-x"/);
+  const other = c.itemHtml({ ...selectItem(), key: 'TS/2024/y', slug: '2024-TIT-Li-y' });
+  assert.match(other, /data-pick="TS\/2024\/y"/);
+  assert.doesNotMatch(other, /data-pick="TS\/2024\/y" checked/);
+});
+
+test('select mode marks knowledge rows and escapes pick attributes', () => {
+  const c = listItemFixture();
+  c.state.selectMode = true;
+  c.state.selected = new Set(['_knowledge/abc']);
+  const html = c.knowledgeItemHtml({
+    key: '_knowledge/abc', kind: 'note', title: 'A <b> note', source: 'note', tags: [],
+  });
+  assert.match(html, /class="item knowledge\s+picked"/);
+  assert.match(html, /data-pick="_knowledge\/abc" checked aria-label="选择 A &lt;b&gt; note"/);
+  assert.doesNotMatch(html, /<b> note/);
+  const escaped = c.pickBoxHtml('a"b<', '"q"');
+  assert.match(escaped, /data-pick="a&quot;b&lt;"/);
+  assert.match(escaped, /aria-label="选择 &quot;q&quot;"/);
+});
+
+test('bulk summary reports added, updated, skipped and the first failure', () => {
+  const c = listItemFixture();
+  assert.equal(c.bulkSummaryText({ added: ['a'], skipped: ['b'] }),
+    '已加入 1 项，跳过 1 项（项目里已有）');
+  assert.equal(c.bulkSummaryText({ updated: ['a'] }), '已更新 1 项');
+  assert.equal(c.bulkSummaryText({}), '没有需要加入的内容');
+  assert.match(c.bulkSummaryText({ added: ['a'], failed: [{ path: 'TS/2024/m', message: '库中没有这篇论文' }] }),
+    /已加入 1 项，失败 1 项（TS\/2024\/m：库中没有这篇论文）/);
+  assert.match(c.bulkSummaryText({ failed: [{ path: 'x' }] }), /失败 1 项（x）/);
+});
+
+function bulkFixture({ responses = [], confirm = false } = {}) {
+  const elements = new Map();
+  const element = () => ({
+    textContent: '', innerHTML: '', value: '', disabled: false, open: false,
+    classList: {
+      set: new Set(),
+      add(name) { this.set.add(name); },
+      remove(name) { this.set.delete(name); },
+      toggle(name, on) {
+        if (on === undefined ? !this.set.has(name) : on) this.set.add(name);
+        else this.set.delete(name);
+      },
+      contains(name) { return this.set.has(name); },
+    },
+    showModal() { this.open = true; },
+    close() { this.open = false; },
+  });
+  const $ = selector => {
+    if (!elements.has(selector)) elements.set(selector, element());
+    return elements.get(selector);
+  };
+  const calls = [], toasts = [], closes = [], modes = [];
+  const c = vm.createContext({
+    state: { project: 'demo', projectSource: 'remote',
+             selected: new Set(['TS/2024/a', 'TS/2024/b']) },
+    $,
+    runLongOperation: (path, options, target) => {
+      calls.push({ path, options, target });
+      const next = responses.shift();
+      if (next instanceof Error) return Promise.reject(next);
+      return Promise.resolve(next || { added: ['TS/2024/a'] });
+    },
+    bulkSummaryText: result => JSON.stringify(result),
+    loadProjectChoices: async () => ({
+      choices: [{ source: 'remote', project: 'demo' }],
+      html: '<option value="0">demo</option>', failures: 0,
+    }),
+    confirmDialog: async () => confirm,
+    toast: (message, kind) => toasts.push({ message, kind }),
+    invalidateProjects() {}, touchProject() {}, loadRefs() {},
+    setSelectMode: on => modes.push(on),
+    closeBulkModal: () => closes.push(true),
+    esc: text => String(text ?? ''),
+  });
+  vm.runInContext(source.slice(source.indexOf('let bulkChoices'),
+    source.indexOf('async function showDetail')), c);
+  return { c, $, calls, toasts, closes, modes, run: code => vm.runInContext(code, c) };
+}
+
+test('bulk add posts one batch request and clears the selection', async () => {
+  const f = bulkFixture({ responses: [{ added: ['TS/2024/a'], skipped: ['TS/2024/b'], failed: [] }] });
+  f.run('bulkChoices = [{ source: "remote", project: "demo" }]');
+  f.$('#bulk-project').value = '0';
+  await f.run('submitBulkAdd()');
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].path, '/api/refs/add-batch');
+  assert.deepEqual(JSON.parse(f.calls[0].options.body), {
+    project: 'demo', source: 'remote', paths: ['TS/2024/a', 'TS/2024/b'] });
+  assert.equal(f.c.state.selected.size, 0);
+  assert.deepEqual(f.modes, [false]);
+  assert.ok(f.$('#bulk-modal').classList.contains('hidden'), 'dialog is closed after the batch');
+  assert.deepEqual(f.toasts.map(t => t.kind), ['ok']);
+});
+
+test('bulk add confirms before creating a missing remote project directory', async () => {
+  const missing = new Error('远端上还没有项目目录');
+  missing.status = 409;
+  missing.detail = { missing_dir: true, project: 'demo' };
+  const f = bulkFixture({ responses: [missing, { added: ['TS/2024/a'], skipped: [], failed: [], created_dir: true }],
+    confirm: true });
+  f.run('bulkChoices = [{ source: "remote", project: "demo" }]');
+  f.$('#bulk-project').value = '0';
+  await f.run('submitBulkAdd()');
+  assert.equal(f.calls.length, 2);
+  assert.equal(JSON.parse(f.calls[1].options.body).create_missing, true);
+  assert.equal(f.c.state.selected.size, 0);
+});
+
+test('cancelling the missing directory prompt keeps the selection and the dialog open', async () => {
+  const missing = new Error('远端上还没有项目目录');
+  missing.status = 409;
+  missing.detail = { missing_dir: true, project: 'demo' };
+  const f = bulkFixture({ responses: [missing], confirm: false });
+  f.run('bulkChoices = [{ source: "remote", project: "demo" }]');
+  f.$('#bulk-project').value = '0';
+  await f.run('submitBulkAdd()');
+  assert.equal(f.calls.length, 1);
+  assert.match(f.$('#bulk-status').textContent, /已取消，未创建目录/);
+  assert.equal(f.$('#bulk-ok').disabled, false);
+  assert.equal(f.c.state.selected.size, 2);
+  assert.ok(!f.$('#bulk-modal').classList.contains('hidden'), 'dialog stays open for a retry');
+});
+
+test('bulk dialog disables confirm when no project exists and enables it otherwise', async () => {
+  const f = bulkFixture();
+  f.run('state.selected = new Set(["TS/2024/a"])');
+  await f.run('openBulkProjectModal()');
+  assert.equal(f.$('#bulk-modal').open, true);
+  assert.match(f.$('#bulk-modal-hint').textContent, /已选的 1 项/);
+  assert.equal(f.$('#bulk-ok').disabled, false);
+  assert.match(f.$('#bulk-project').innerHTML, /<option value="0">demo<\/option>/);
+  f.c.loadProjectChoices = async () => ({ choices: [], html: '<option value="">选择项目…</option>', failures: 0 });
+  await f.run('openBulkProjectModal()');
+  assert.equal(f.$('#bulk-status').textContent, '还没有项目，先到「项目引用」添加');
+  assert.equal(f.$('#bulk-ok').disabled, true);
+});
+
+test('multi-select toolbar, bulk bar and dialog are wired in the page shell', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../app/static/index.html'), 'utf8');
+  assert.match(html, /id="select-toggle"[^>]*aria-pressed="false"/);
+  assert.match(html, /id="bulk-bar"[^>]*class="bulk-bar hidden"/);
+  for (const id of ['bulk-count', 'bulk-all', 'bulk-none', 'bulk-add-project', 'bulk-exit',
+                    'bulk-modal', 'bulk-modal-hint', 'bulk-project', 'bulk-status',
+                    'bulk-ok', 'bulk-cancel']) {
+    assert.ok(html.includes(`id="${id}"`), id);
+  }
+  assert.match(source, /'\/api\/refs\/add-batch'/);
+  assert.match(source, /\$\('#bulk-ok'\)\.onclick = submitBulkAdd/);
+});
+
+test('group selection toggles every key in the group and reports the new state', () => {
+  const c = listItemFixture();
+  assert.equal(c.applyGroupSelection(['TS/2024/a', 'TS/2024/b']), true);
+  assert.deepEqual([...c.state.selected].sort(), ['TS/2024/a', 'TS/2024/b']);
+  assert.equal(c.applyGroupSelection(['TS/2024/a']), false);
+  assert.deepEqual([...c.state.selected].sort(), ['TS/2024/b']);
+  assert.equal(c.applyGroupSelection(['TS/2023/c']), true);
+  assert.deepEqual([...c.state.selected].sort(), ['TS/2023/c', 'TS/2024/b']);
+  assert.equal(c.applyGroupSelection([]), true, 'an empty group reports no change to selected-all');
+});
+
+test('group pick boxes carry escaped topic and year keys', () => {
+  const c = listItemFixture();
+  assert.match(c.groupPickHtml('topic', 'TS/2024', '选择主题 TS/2024'),
+    /class="group-pick" data-pick-topic="TS\/2024" aria-label="选择主题 TS\/2024" title="选择整个主题"/);
+  const escaped = c.groupPickHtml('year', 'a"b', '选择 a"b 2024 年');
+  assert.match(escaped, /data-pick-year="a&quot;b"/);
+  assert.match(escaped, /aria-label="选择 a&quot;b 2024 年"/);
+  assert.match(escaped, /title="选择整个年份"/);
+});
+
+test('topic and year headers expose group pick boxes in select mode only', () => {
+  assert.match(source, /\$\{state\.selectMode \? groupPickHtml\('topic', topic, `选择主题 \$\{topic\}`\) : ''\}/);
+  assert.match(source, /\$\{state\.selectMode \? groupPickHtml\('year', yKey, `选择 \$\{topic\} \$\{year\} 年`\) : ''\}/);
+  assert.match(source, /\$\$\('#list \.group-pick'\)\.forEach/);
+  assert.match(source, /box\.indeterminate = chosen > 0 && chosen < keys\.length/);
 });
